@@ -1,3 +1,4 @@
+[![PyPI version](https://badge.fury.io/py/popidd-spot.svg?icon=si%3Apython)](https://badge.fury.io/py/popidd-spot)
 # POPIDD-SPOT: Spatial Profiling Overview Tool
 
 POPIDD-SPOT let's you perform spot checks for spatial transcriptomics datasets and generate shareable reports.

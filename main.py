@@ -535,8 +535,9 @@ filtered_df = pn.bind(cached_filtered_df, state.param.data_revision, fov_select)
 cell_stats = pn.bind(cached_cell_stats, state.param.data_revision, fov_select)
 
 
-def indicator_card(value, label: str, fmt: str = "{:,.0f}") -> pn.pane.HTML:
-    """Render a single KPI indicator card."""
+
+def indicator_card(value, label: str, fmt: str = "{:,.0f}", min_width: int = 220):
+    """Render a single KPI indicator card as a responsive flex item."""
     if value is None:
         display_value = "—"
     elif isinstance(value, (int, float)):
@@ -545,12 +546,67 @@ def indicator_card(value, label: str, fmt: str = "{:,.0f}") -> pn.pane.HTML:
         display_value = str(value)
 
     html = f"""
-    <div style="text-align:center;height:100%;display:flex;flex-direction:column;justify-content:center;">
-        <div style="font-size:clamp(11px,1.5vw,14px);color:#999;margin-bottom:8px;font-weight:500;">{label}</div>
-        <div style="font-size:clamp(18px,4vw,32px);font-weight:bold;color:#333;">{display_value}</div>
+    <div style="
+        text-align:center;
+        height:100%;
+        display:flex;
+        flex-direction:column;
+        justify-content:center;
+    ">
+        <div style="
+            font-size:clamp(11px,1.5vw,14px);
+            color:#999;
+            margin-bottom:8px;
+            font-weight:500;
+        ">{label}</div>
+        <div style="
+            font-size:clamp(18px,4vw,32px);
+            font-weight:bold;
+            color:#333;
+        ">{display_value}</div>
     </div>
     """
-    return pn.pane.HTML(html, styles=CARD_STYLES, sizing_mode="stretch_both")
+
+    return pn.Column(
+        pn.pane.HTML(
+            html,
+            sizing_mode="stretch_both",
+            styles={
+                **CARD_STYLES,
+                "height": "100%",
+                "min-height": "100px",
+                "box-sizing": "border-box",
+            },
+        ),
+        sizing_mode="stretch_width",
+        min_width=min_width,
+        height=110,
+        styles={
+            "flex": f"1 1 {min_width}px",
+        },
+    )
+
+
+def responsive_indicator_grid(*cards, min_card_width: int = 220, gap: str = "12px"):
+    """Lay out cards in a responsive CSS grid.
+
+    The browser automatically chooses how many columns fit:
+    - wide windows: 4 cards in one row
+    - medium/portrait: typically 2x2
+    - very narrow: 1 column
+    """
+    return pn.FlexBox(
+        *cards,
+        sizing_mode="stretch_width",
+        styles={
+            "display": "grid",
+            "grid-template-columns": f"repeat(auto-fit, minmax(min(100%, {min_card_width}px), 1fr))",
+            "gap": gap,
+            "align-items": "stretch",
+            "width": "100%",
+        },
+    )
+
 
 
 def status_card(value: int, label: str, color: str) -> pn.pane.HTML:
@@ -688,7 +744,7 @@ def spatial_plot(
             C=color_by,
             reduce_function=np.mean,
             clabel=f"Mean {color_by}",
-            gridsize=256,
+            gridsize=512,
             min_count=1,
             cmap="viridis",
             colorbar=True,
@@ -721,7 +777,7 @@ def spatial_plot(
             C="_color_code",
             reduce_function=majority_code,
             clabel=f"Majority {color_by}",
-            gridsize=256,
+            gridsize=512,
             min_count=1,
             cmap=palette,
             colorbar=False,
@@ -739,19 +795,28 @@ def spatial_plot(
     )
 
 
+
+
 def create_indicators(stats: dict[str, float | int | None]):
-    """Create the summary KPI row for the currently selected dataset slice."""
+    """Create a responsive KPI layout for the selected dataset slice."""
     if not stats:
         return panel_message("No data available.")
 
-    return pn.Row(
+    return pn.FlexBox(
         indicator_card(stats.get("cell_count"), "Total Cells"),
         indicator_card(stats.get("median_rna"), "Med. Transcripts/Cell"),
         indicator_card(stats.get("med_features"), "Med. Genes/Cell"),
         indicator_card(stats.get("avg_area"), "Avg. Cell Area (µm²)", "{:,.1f}"),
+        flex_wrap="wrap",
         sizing_mode="stretch_width",
-        height=100,
+        styles={
+            "gap": "12px",
+            "align-items": "stretch",
+            "width": "100%",
+        },
     )
+
+
 
 
 def _empty_tabulator() -> pn.widgets.Tabulator:
@@ -933,7 +998,7 @@ def build_summary_tab(views: Mapping[str, object]) -> pn.Column:
     """Build the summary tab layout."""
     return pn.Column(
         pn.pane.Markdown("### Key QC Metrics"),
-        pn.Row(views["indicators"], sizing_mode="stretch_width"),
+        views["indicators"],
         pn.pane.Markdown("### Sample Overview"),
         pn.Row(
             pn.Column(
@@ -951,6 +1016,7 @@ def build_summary_tab(views: Mapping[str, object]) -> pn.Column:
         sizing_mode="stretch_both",
         scroll=True,
     )
+
 
 
 def build_sequencing_tab(views: Mapping[str, object]) -> pn.Column:

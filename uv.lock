@@ -1635,7 +1635,7 @@ wheels = [
 [[package]]
 name = "popidd-spot"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "bokeh" },
     { name = "hvplot" },

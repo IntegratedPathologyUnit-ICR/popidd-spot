@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Mapping
@@ -17,16 +16,10 @@ import param
 import holoviews as hv
 from holoviews import dim
 from matplotlib import cm, colors as mcolors
-from bokeh.models import Range1d, ColorBar, FixedTicker, CustomJSTickFormatter
+from bokeh.models import Range1d
 
 
 pn.extension("tabulator", "filedropper", design="bootstrap", theme="default")
-
-
-# ============================================================================
-# System & Environment Setup
-# ============================================================================
-
 
 def get_total_memory_gb() -> int:
     """Return the total physical memory in gigabytes.
@@ -66,19 +59,15 @@ def get_total_memory_gb() -> int:
     except Exception:
         return 4
 
-
-# ============================================================================
-# Application Configuration
-# ============================================================================
-
-# UI Theme & Styling
-ACCENT_COLOR = "teal"
-
-# Data & File Paths
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+ACCENT = "teal"
 DATA_DIR = Path("input")
 DEFAULT_REPORT_PATH = Path("report/popidd-spot_report.html")
 
-# Plot Dimensions (pixels)
+TABLE_PAGE_SIZE = 25
+
 PLOT_MIN_HEIGHT = 360
 PLOT_TALL_MIN_HEIGHT = 460
 PLOT_SHORT_MIN_HEIGHT = 220
@@ -87,138 +76,87 @@ PLOT_MIN_WIDTH = 320
 PLOT_PANEL_MIN_WIDTH = 420
 PLOT_MAX_WIDTH = 1000
 
-# UI Spacing
-TABLE_PAGE_SIZE = 25
-FLEX_GAP_DEFAULT = "12px"
-FLEX_GAP_WIDE = "16px"
-
-# Spatial Plot Configuration
 SPATIAL_X_COL = "CenterX_global_px"
 SPATIAL_Y_COL = "CenterY_global_px"
 DEFAULT_SPATIAL_COLOR_BY = "Mean.DAPI"
 SPATIAL_PLOT_GRIDSIZE = 512
 MAX_LIVE_SPATIAL_POINTS = get_total_memory_gb() * 100_000
 MAX_SPATIAL_CATEGORIES = 20
-
-# Spatial Plot Color Palette
 SPATIAL_CATEGORY_COLORS = [
-    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
-    "#393b79", "#637939", "#8c6d31", "#843c39", "#7b4173",
-    "#3182bd", "#31a354", "#756bb1", "#636363", "#e6550d",
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+    "#bcbd22",
+    "#17becf",
+    "#393b79",
+    "#637939",
+    "#8c6d31",
+    "#843c39",
+    "#7b4173",
+    "#3182bd",
+    "#31a354",
+    "#756bb1",
+    "#636363",
+    "#e6550d",
 ]
 
-# QC Thresholds
-QC_CELL_THRESHOLD = 20  # Minimum nCount_RNA per cell
-QC_FOV_THRESHOLD = 24  # Minimum median RNA per FOV
-
-# FOV Median RNA Color Scale (centered at 48)
+QC_CELL_THRESHOLD = 20
+QC_FOV_THRESHOLD = 24
 FOV_MEDIAN_RNA_CENTER = 48.0
 FOV_MEDIAN_RNA_DISPLAY_MIN = FOV_MEDIAN_RNA_CENTER / 3
 FOV_MEDIAN_RNA_DISPLAY_MAX = FOV_MEDIAN_RNA_CENTER * 3
 
-# Card Styling (HTML/CSS)
 CARD_STYLES = {
     "box-shadow": "rgba(50, 50, 93, 0.25) 0px 6px 12px -2px, rgba(0, 0, 0, 0.30) 0px 3px 7px -3px",
     "border-radius": "4px",
     "padding": "10px",
 }
 
-# Status Colors
 QC_STATUS_COLORS = {
     "passed": "#22c55e",
     "flagged": "#ef4444",
     "total": "#6b7280",
 }
 
-# Bokeh/HvPlot Tools
 PLOT_TOOLS = ["hover", "box_select", "lasso_select", "reset"]
 
-# Logging Configuration
+# Logging
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Generic Data Utilities
+# Generic Helpers & Setup
 # ============================================================================
-
 
 def empty_df() -> pd.DataFrame:
     """Return a new empty DataFrame."""
     return pd.DataFrame()
 
-
 def has_cols(df: pd.DataFrame | None, *cols: str) -> bool:
-    """Check if DataFrame has all required columns.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        DataFrame to check
-    *cols : str
-        Column names to verify
-
-    Returns
-    -------
-    bool
-        True if df is non-empty and contains all columns, False otherwise
-    """
+    """Return whether the DataFrame exists, is non-empty, and contains all columns."""
     return df is not None and not df.empty and all(col in df.columns for col in cols)
 
 
 def safe_numeric(series: pd.Series) -> pd.Series:
-    """Coerce Series to numeric, replacing invalid values with NaN.
-
-    Parameters
-    ----------
-    series : pd.Series
-        Input series to convert
-
-    Returns
-    -------
-    pd.Series
-        Numeric series with invalid values as NaN
-    """
+    """Coerce a Series to numeric values, replacing invalid entries with NaN."""
     return pd.to_numeric(series, errors="coerce")
 
 
 def panel_message(text: str, alert_type: str | None = None) -> pn.pane.Pane:
-    """Create a Panel message pane, optionally styled as an alert.
-
-    Parameters
-    ----------
-    text : str
-        Message text to display
-    alert_type : str, optional
-        Alert type from {"info", "success", "warning", "danger"}.
-        If None, renders as plain markdown.
-
-    Returns
-    -------
-    pn.pane.Pane
-        Alert or markdown pane
-    """
+    """Return a Panel message pane, optionally styled as an alert."""
     if alert_type:
         return pn.pane.Alert(text, alert_type=alert_type, sizing_mode="stretch_width")
     return pn.pane.Markdown(text, sizing_mode="stretch_width")
 
-
 def plot_kwargs(**extra: dict) -> dict:
-    """Return standard hvPlot keyword arguments with optional overrides.
-
-    Provides responsive, base plot settings suitable for most plots.
-
-    Parameters
-    ----------
-    **extra : dict
-        Additional keyword arguments to override defaults
-
-    Returns
-    -------
-    dict
-        hvPlot keyword arguments
-    """
+    """Return standard hvPlot keyword arguments with optional overrides."""
     base = {
         "responsive": True,
         "shared_axes": False,
@@ -227,45 +165,17 @@ def plot_kwargs(**extra: dict) -> dict:
     return base
 
 
-
 # ============================================================================
-# Data Sanitization & Column Utilities
+# Data Sanitising
 # ============================================================================
-
 
 def normalize_colname(name: str) -> str:
-    """Normalize column name for case-insensitive, punctuation-insensitive matching.
-
-    Parameters
-    ----------
-    name : str
-        Column name to normalize
-
-    Returns
-    -------
-    str
-        Lowercased, alphanumeric-only version
-    """
+    """Normalise a column name for case- and punctuation-insensitive matching."""
     return "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
 
 
 def find_column(df: pd.DataFrame | None, *aliases: str) -> str | None:
-    """Find DataFrame column matching any provided alias (case/punctuation-insensitive).
-
-    Useful for flexible field names across different data formats.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        DataFrame to search
-    *aliases : str
-        Alternative column names to try (in priority order)
-
-    Returns
-    -------
-    str | None
-        The first matching actual column name, or None if not found
-    """
+    """Return the first DataFrame column matching any provided alias."""
     if df is None or df.empty:
         return None
 
@@ -276,20 +186,8 @@ def find_column(df: pd.DataFrame | None, *aliases: str) -> str | None:
             return normalized[key]
     return None
 
-
 def is_supported_color_column(series: pd.Series) -> bool:
-    """Check if Series can be used for spatial plot color encoding.
-
-    Parameters
-    ----------
-    series : pd.Series
-        Series to evaluate
-
-    Returns
-    -------
-    bool
-        True if series is numeric, bool, categorical, or string dtype
-    """
+    """Return whether a Series can be used for spatial colour encoding."""
     return (
         pd.api.types.is_numeric_dtype(series)
         or pd.api.types.is_bool_dtype(series)
@@ -298,80 +196,31 @@ def is_supported_color_column(series: pd.Series) -> bool:
         or pd.api.types.is_string_dtype(series)
     )
 
-
 def classify_color_column(series: pd.Series) -> str:
-    """Classify Series as numeric or categorical for visualization.
-
-    Parameters
-    ----------
-    series : pd.Series
-        Series to classify
-
-    Returns
-    -------
-    str
-        Either "numeric" or "categorical"
-    """
+    """Classify a colour column as numeric or categorical."""
     if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
         return "numeric"
     return "categorical"
 
 
-
 # ============================================================================
-# Application State Management
+# State Model and Mutators
 # ============================================================================
-
 
 def get_first_csv_path(data_dir: Path = DATA_DIR) -> Path | None:
-    """Find the first CSV file in the data directory.
-
-    Parameters
-    ----------
-    data_dir : Path
-        Directory to search
-
-    Returns
-    -------
-    Path | None
-        Path to the first CSV file (sorted), or None if none found
-    """
+    """Return the first CSV file found in the input directory, if any."""
     if not data_dir.exists() or not data_dir.is_dir():
         return None
     csv_files = sorted(p for p in data_dir.glob("*.csv") if p.is_file())
     return csv_files[0] if csv_files else None
 
-
 def get_initial_filename() -> str:
-    """Get the initial dataset filename for UI display.
-
-    Returns
-    -------
-    str
-        Filename of default dataset or placeholder message
-    """
+    """Return the initial dataset filename shown in the UI."""
     default_path = get_first_csv_path()
     return default_path.name if default_path is not None else "No dataset loaded"
 
-
 class DataState(param.Parameterized):
-    """Central state container for application data and UI status.
-
-    Attributes
-    ----------
-    data : pd.DataFrame
-        Current dataset loaded into application
-    filename : str
-        Filename of current dataset
-    pending_filename : str
-        Filename of uploaded but not-yet-loaded file
-    data_revision : int
-        Revision counter incremented on data updates (for cache invalidation)
-    status_message : str
-        Current status message to display to user
-    status_level : str
-        Severity level: info, success, warning, or danger
-    """
+    """Store the current dataset, file selection, and UI status."""
 
     data = param.Parameter(default=pd.DataFrame())
     filename = param.String(default=get_initial_filename())
@@ -383,51 +232,19 @@ class DataState(param.Parameterized):
         objects=["info", "success", "warning", "danger"],
     )
 
-
 def set_status(message: str = "", level: str = "info") -> None:
-    """Update global application status message.
-
-    Parameters
-    ----------
-    message : str
-        Status message to display
-    level : str
-        Alert level: info, success, warning, or danger
-    """
+    """Update the global application status message and severity level."""
     state.status_message = message
     state.status_level = level
 
-
 def set_data(df: pd.DataFrame | None, filename: str) -> None:
-    """Update global dataset and increment revision counter.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        New dataset to load (None becomes empty DataFrame)
-    filename : str
-        Source filename for UI display
-    """
+    """Update the global dataset state and increment its revision counter."""
     state.data = df if df is not None else empty_df()
     state.filename = filename
     state.data_revision += 1
 
-
 def read_csv_from_source(source: bytes | bytearray | str | os.PathLike | None) -> pd.DataFrame:
-    """Read CSV data from multiple source types.
-
-    Supports: bytes/bytearray (uploaded), strings (text), file-like objects, and filesystem paths.
-
-    Parameters
-    ----------
-    source : bytes | bytearray | str | os.PathLike | None
-        CSV data source
-
-    Returns
-    -------
-    pd.DataFrame
-        Loaded dataframe, or empty dataframe if source is invalid/empty
-    """
+    """Read CSV data from bytes, text, file-like objects, or filesystem paths."""
     if source is None:
         return empty_df()
 
@@ -446,63 +263,52 @@ def read_csv_from_source(source: bytes | bytearray | str | os.PathLike | None) -
 
     return pd.read_csv(source)
 
-
 def add_qc_flags_to_df(df: pd.DataFrame | None) -> pd.DataFrame:
-    """Add QC flag columns to DataFrame based on RNA count thresholds.
+    """Add QC flag columns to DataFrame based on RNA thresholds.
 
-    Creates two flag columns:
-    - 'qc_flagged_cell': 1 if nCount_RNA < 20, else 0
-    - 'qc_flagged_fov': 1 if FOV median_RNA < 24, else 0
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Input dataset
-
-    Returns
-    -------
-    pd.DataFrame
-        Dataset with appended QC flag columns (or unchanged if None/empty)
+    Adds two columns:
+    - 'qc_flagged_cell': 1 if cell's nCount_RNA < 20, else 0
+    - 'qc_flagged_fov': 1 if FOV's median_RNA < 24, else 0
     """
     if df is None or df.empty:
         return df
 
     df = df.copy()
 
-    # Cell-level QC: nCount_RNA threshold
+    # -----------------------
+    # Cell-level QC flag
+    # -----------------------
     ncount_rna_col = find_column(df, "nCount_RNA", "ncountrna", "count_rna")
     if ncount_rna_col is not None:
-        df["qc_flagged_cell"] = (safe_numeric(df[ncount_rna_col]) < QC_CELL_THRESHOLD).astype(int)
+        df["qc_flagged_cell"] = (safe_numeric(df[ncount_rna_col]) < 20).astype(int)
     else:
         df["qc_flagged_cell"] = 0
 
-    # FOV-level QC: median_RNA threshold
+    # -----------------------
+    # FOV-level QC flag
+    # -----------------------
     fov_col = find_column(df, "fov", "FOV", "field_of_view", "fieldofview")
     median_rna_col = find_column(df, "median_RNA", "medianrna", "median_rna")
 
     if fov_col is not None and median_rna_col is not None:
+        # Use precomputed median_RNA directly
         median_rna = safe_numeric(df[median_rna_col])
-        df["qc_flagged_fov"] = (median_rna < QC_FOV_THRESHOLD).astype(int)
+        df["qc_flagged_fov"] = (median_rna < 24).astype(int)
+
     elif fov_col is not None and ncount_rna_col is not None:
-        # Fallback: compute median nCount_RNA per FOV when median_RNA not available
+        # Fallback: compute median nCount_RNA per FOV
         fov_median = df.groupby(fov_col)[ncount_rna_col].transform(
             lambda x: safe_numeric(x).median()
         )
-        df["qc_flagged_fov"] = (fov_median < QC_FOV_THRESHOLD).astype(int)
+        df["qc_flagged_fov"] = (fov_median < 24).astype(int)
+
     else:
         df["qc_flagged_fov"] = 0
 
     return df
 
-
 def load_default_data() -> tuple[pd.DataFrame, str]:
-    """Load the default dataset from DATA_DIR.
-
-    Returns
-    -------
-    tuple[pd.DataFrame, str]
-        (dataframe, filename) or (empty dataframe, "No dataset loaded") on failure
-    """
+    """Load the first available CSV from the default data directory."""
     path = get_first_csv_path()
 
     if path is None:
@@ -523,45 +329,28 @@ def load_default_data() -> tuple[pd.DataFrame, str]:
         return empty_df(), "No dataset loaded"
 
 
-# Initialize global state
 state = DataState()
 _default_df, _default_name = load_default_data()
 set_data(_default_df, _default_name)
 
 
 # ============================================================================
-# Data I/O, File Upload & CSV Handling
+# Data I/O & CSV Handling
 # ============================================================================
 
-
 def get_source_data() -> pd.DataFrame:
-    """Get the current source dataset from application state."""
+    """Return the current source dataset."""
     return state.data if state.data is not None else empty_df()
 
 
 def get_colorby_options(df: pd.DataFrame | None) -> list[str]:
-    """Get valid columns for spatial plot color encoding.
-
-    Returns columns that support color visualization, prioritizing default
-    and adding QC flags at the end.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset to scan
-
-    Returns
-    -------
-    list[str]
-        Ordered list of valid color-by columns
-    """
+    """Return valid columns that can be used to colour the spatial plot."""
     if df is None or df.empty:
         return [DEFAULT_SPATIAL_COLOR_BY]
 
-    excluded = {SPATIAL_X_COL, SPATIAL_Y_COL}
+    excluded = {"CenterX_global_px", "CenterY_global_px"}
     cols = [c for c in df.columns if c not in excluded and is_supported_color_column(df[c])]
 
-    # Prioritize default color column
     ordered: list[str] = []
     if DEFAULT_SPATIAL_COLOR_BY in cols:
         ordered.append(DEFAULT_SPATIAL_COLOR_BY)
@@ -576,7 +365,7 @@ def get_colorby_options(df: pd.DataFrame | None) -> list[str]:
 
 
 def update_colorby_options(*_) -> None:
-    """Refresh the spatial colour-by widget options from current dataset."""
+    """Refresh the spatial colour-by widget options from the current dataset."""
     options = get_colorby_options(state.data)
     color_by_select.options = options
     if color_by_select.value not in options:
@@ -584,19 +373,9 @@ def update_colorby_options(*_) -> None:
 
 
 def majority_code(values) -> float:
-    """Get the most frequent integer code in array-like input.
+    """Return the most frequent integer code in an array-like input.
 
-    Used for aggregating categorical data in hexbin plots.
-
-    Parameters
-    ----------
-    values : array-like
-        Input values (may contain NaN)
-
-    Returns
-    -------
-    float
-        Most common integer code, or NaN if no valid values
+    NaN values are ignored. If no valid values remain, NaN is returned.
     """
     arr = np.asarray(values)
     if arr.size == 0:
@@ -609,7 +388,6 @@ def majority_code(values) -> float:
     return float(uniq[np.argmax(counts)])
 
 
-# UI Widgets for Data Loading
 file_dropper = pn.widgets.FileDropper(
     multiple=False,
     max_files=1,
@@ -632,7 +410,8 @@ color_by_select = pn.widgets.Select(
     options=[DEFAULT_SPATIAL_COLOR_BY],
 )
 
-# Export Widgets
+
+# Export widgets for sidebar
 export_html_button = pn.widgets.Button(
     name="Export HTML Report",
     button_type="success",
@@ -646,7 +425,7 @@ export_csv_button = pn.widgets.Button(
 )
 
 
-def on_export_html_clicked(event) -> None:
+def _on_export_html(event) -> None:
     """Handle HTML export button click."""
     try:
         save_as_html()
@@ -656,7 +435,7 @@ def on_export_html_clicked(event) -> None:
         set_status(f"Error exporting HTML: {exc}", "danger")
 
 
-def on_export_csv_clicked(event) -> None:
+def _on_export_csv(event) -> None:
     """Handle CSV export button click."""
     try:
         save_data_as_csv()
@@ -665,18 +444,12 @@ def on_export_csv_clicked(event) -> None:
         set_status(f"Error exporting CSV: {exc}", "danger")
 
 
-export_html_button.on_click(on_export_html_clicked)
-export_csv_button.on_click(on_export_csv_clicked)
+export_html_button.on_click(_on_export_html)
+export_csv_button.on_click(_on_export_csv)
 
 
-def get_uploaded_csv() -> tuple[str | None, str | bytes | None]:
-    """Extract uploaded CSV filename and content if valid.
-
-    Returns
-    -------
-    tuple[str | None, str | bytes | None]
-        (filename, content) or (None, None) if invalid/missing
-    """
+def _get_uploaded_csv() -> tuple[str | None, str | bytes | None]:
+    """Return the uploaded CSV filename and content when exactly one valid file is present."""
     uploads = file_dropper.value or {}
     if len(uploads) != 1:
         return None, None
@@ -690,9 +463,9 @@ def get_uploaded_csv() -> tuple[str | None, str | bytes | None]:
     return filename, content
 
 
-def on_file_selected(event) -> None:
+def _on_file_selected(event) -> None:
     """Handle file-dropper changes and update pending file state."""
-    filename, _ = get_uploaded_csv()
+    filename, _ = _get_uploaded_csv()
     state.pending_filename = filename or ""
 
     has_valid_file = filename is not None
@@ -711,9 +484,9 @@ def on_file_selected(event) -> None:
             set_status("", "info")
 
 
-def load_selected_dataset(event=None) -> None:
+def _load_selected_dataset(event=None) -> None:
     """Load the currently uploaded CSV into application state."""
-    filename, content = get_uploaded_csv()
+    filename, content = _get_uploaded_csv()
 
     if filename is None or content is None:
         set_status("Please upload exactly one CSV file first.", "warning")
@@ -729,8 +502,8 @@ def load_selected_dataset(event=None) -> None:
         set_status(f"Error loading `{filename}`: {exc}", "danger")
 
 
-file_dropper.param.watch(on_file_selected, "value")
-load_button.on_click(load_selected_dataset)
+file_dropper.param.watch(_on_file_selected, "value")
+load_button.on_click(_load_selected_dataset)
 
 
 # ============================================================================
@@ -739,18 +512,7 @@ load_button.on_click(load_selected_dataset)
 
 
 def compute_fov_summary(df: pd.DataFrame | None) -> pd.DataFrame:
-    """Create a per-FOV summary table from cell-level or summary-level data.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Cell-level or FOV-level dataset
-
-    Returns
-    -------
-    pd.DataFrame
-        FOV-level summary with standardized columns (fov, nCell, nCount, etc.)
-    """
+    """Create a per-FOV summary table from summary-level or cell-level data."""
     if df is None or df.empty:
         return empty_df()
 
@@ -758,7 +520,6 @@ def compute_fov_summary(df: pd.DataFrame | None) -> pd.DataFrame:
     if fov_col is None:
         return empty_df()
 
-    # Define expected summary columns and their aliases
     summary_aliases = {
         "nCell": ("nCell", "ncell", "cell_count", "cells"),
         "nCount": ("nCount", "ncount", "total_counts", "totalcount"),
@@ -769,21 +530,18 @@ def compute_fov_summary(df: pd.DataFrame | None) -> pd.DataFrame:
         "qcFlagsFOV": ("qcFlagsFOV", "qcflagsfov", "qc_flags_fov"),
     }
 
-    # Try to find pre-summarized columns first
     resolved = {"fov": fov_col}
     for canonical, aliases in summary_aliases.items():
         actual = find_column(df, *aliases)
         if actual is not None:
             resolved[canonical] = actual
 
-    # If summary columns already exist, use them directly
     if "nCell" in resolved and "nCount" in resolved:
         cols = ["fov"] + [c for c in summary_aliases if c in resolved]
         out = df[[resolved[c] for c in cols]].copy()
         out.columns = cols
         return out.drop_duplicates().sort_values("fov")
 
-    # Fallback: compute summary from cell-level data
     cell_id_col = find_column(df, "cell_id", "cellid")
     ncount_rna_col = find_column(df, "nCount_RNA", "ncountrna", "count_rna")
     nfeature_rna_col = find_column(df, "nFeature_RNA", "nfeaturerna", "feature_rna")
@@ -812,23 +570,12 @@ def compute_fov_summary(df: pd.DataFrame | None) -> pd.DataFrame:
 
 @lru_cache(maxsize=64)
 def cached_fov_summary(data_revision: int) -> pd.DataFrame:
-    """Get cached FOV summary, invalidated when data_revision changes."""
+    """Return a cached FOV summary keyed by dataset revision."""
     return compute_fov_summary(state.data)
 
 
 def get_fov_options(summary: pd.DataFrame | None) -> list[str]:
-    """Get FOV selector options from FOV summary table.
-
-    Parameters
-    ----------
-    summary : pd.DataFrame | None
-        FOV summary
-
-    Returns
-    -------
-    list[str]
-        Sorted FOV values with "All" at start
-    """
+    """Return the FOV selector options derived from a summary table."""
     if summary is None or summary.empty or "fov" not in summary.columns:
         return ["All"]
 
@@ -842,14 +589,13 @@ def get_fov_options(summary: pd.DataFrame | None) -> list[str]:
 
 
 def update_fov_options(*_) -> None:
-    """Refresh FOV selector options for current dataset."""
+    """Refresh the FOV selector options for the current dataset."""
     options = get_fov_options(cached_fov_summary(state.data_revision))
     fov_select.options = options
     if fov_select.value not in options:
         fov_select.value = "All"
 
 
-# Watch for data changes and update UI options
 state.param.watch(update_fov_options, "data_revision")
 update_fov_options()
 
@@ -857,21 +603,13 @@ state.param.watch(update_colorby_options, "data_revision")
 update_colorby_options()
 
 
-def filter_data_by_fov(df: pd.DataFrame | None, fov: str) -> pd.DataFrame:
-    """Filter dataset to a selected field of view.
+# ============================================================================
+# UI Widgets & Controls
+# ============================================================================
 
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Input dataset
-    fov : str
-        FOV identifier ("All" for no filtering)
 
-    Returns
-    -------
-    pd.DataFrame
-        Filtered dataset
-    """
+def filter_data(df: pd.DataFrame | None, fov: str) -> pd.DataFrame:
+    """Filter a dataset to a selected field of view."""
     if df is None or df.empty:
         return empty_df()
 
@@ -881,7 +619,6 @@ def filter_data_by_fov(df: pd.DataFrame | None, fov: str) -> pd.DataFrame:
 
     fov_series = df[fov_col]
 
-    # Try numeric FOV matching first
     try:
         numeric_fov = pd.to_numeric(fov_series, errors="coerce")
         target = int(fov)
@@ -891,38 +628,23 @@ def filter_data_by_fov(df: pd.DataFrame | None, fov: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback to string matching
     return df[fov_series.astype(str) == str(fov)]
 
 
 @lru_cache(maxsize=128)
 def cached_filtered_df(data_revision: int, fov: str) -> pd.DataFrame:
-    """Get cached FOV-filtered dataset, invalidated when data or FOV changes."""
-    return filter_data_by_fov(state.data, fov)
+    """Return a cached FOV-filtered DataFrame."""
+    return filter_data(state.data, fov)
 
 
 @lru_cache(maxsize=128)
 def cached_cell_stats(data_revision: int, fov: str) -> dict[str, float | int | None]:
-    """Get cached summary statistics for the filtered dataset.
-
-    Parameters
-    ----------
-    data_revision : int
-        Cache key (from state.data_revision)
-    fov : str
-        FOV filter
-
-    Returns
-    -------
-    dict[str, float | int | None]
-        Statistics including cell_count, median_rna, etc.
-    """
+    """Return cached summary statistics for the selected filtered dataset."""
     df = cached_filtered_df(data_revision, fov)
     if df is None or df.empty:
         return {}
 
     def col_stat(col: str, fn: Callable[[pd.Series], float], default=None):
-        """Get a statistic from a column if it exists."""
         if col not in df.columns:
             return default
         s = safe_numeric(df[col]).dropna()
@@ -939,13 +661,12 @@ def cached_cell_stats(data_revision: int, fov: str) -> dict[str, float | int | N
     }
 
 
-# Reactive data bindings for dashboard
 filtered_df = pn.bind(cached_filtered_df, state.param.data_revision, fov_select)
 cell_stats = pn.bind(cached_cell_stats, state.param.data_revision, fov_select)
 
 
 # ============================================================================
-# Plot Rendering & Styling Utilities
+# Plot Rendering & Styling
 # ============================================================================
 
 
@@ -960,34 +681,26 @@ def plot_box(
     aspect_ratio: float | None = None,
     linked_axes: bool = False,
 ) -> pn.Column:
-    """Wrap a plot in a responsive container with optional title.
-
-    Supports square or custom aspect ratio layouts for maps/heatmaps,
-    or standard rectangular layouts for line/bar charts.
-
+    """Responsive container for Bokeh/HoloViews plots.
+    
     Parameters
     ----------
     plot : object
-        HoloViews or Bokeh plot object
+        The HoloViews or Bokeh plot to embed.
     min_height : int
-        Minimum height in pixels (standard plots)
+        Minimum height in pixels for standard plots.
     min_width : int
-        Minimum width in pixels
+        Minimum width in pixels.
     max_width : int, optional
-        Maximum width in pixels (useful for wide monitors)
+        Maximum width in pixels. If None, no limit is applied.
     title : str, optional
-        Plot title to display above plot
+        Title to display above the plot.
     square : bool
-        If True, enforce 1:1 aspect ratio
+        If True, use square layout (1:1 aspect ratio) with scale_width sizing.
     aspect_ratio : float, optional
-        Custom aspect ratio (e.g., 4/3). Overrides square parameter.
+        Custom aspect ratio (e.g., 4/3 for 4:3). If provided, overrides square.
     linked_axes : bool
-        Enable linked axes in HoloViews pane
-
-    Returns
-    -------
-    pn.Column
-        Responsive plot container
+        Whether to enable linked axes in the HoloViews pane.
     """
     header = (
         pn.pane.Markdown(f"#### {title}", margin=(0, 0, 6, 0))
@@ -1003,10 +716,11 @@ def plot_box(
     if max_width is not None:
         styles_base["max-width"] = f"{max_width}px"
 
+    # Determine if we should use scale_width sizing (for square or aspect ratio)
     use_scale_width = square or aspect_ratio is not None
 
     if use_scale_width:
-        # Square or custom aspect ratio plot
+        # Square or custom aspect ratio plot with scale_width sizing
         return pn.Column(
             header,
             pn.pane.HoloViews(
@@ -1020,80 +734,46 @@ def plot_box(
             sizing_mode="stretch_width",
             styles=styles_base,
         )
-    else:
-        # Standard rectangular plot
-        return pn.Column(
-            header,
-            pn.pane.HoloViews(
-                plot,
-                sizing_mode="stretch_width",
-                min_height=min_height,
-                linked_axes=linked_axes
-            ),
-            min_height=min_height + (32 if title else 0),
-            min_width=min_width,
+
+    # Standard rectangular plot
+    return pn.Column(
+        header,
+        pn.pane.HoloViews(
+            plot,
             sizing_mode="stretch_width",
-            styles=styles_base,
-        )
+            min_height=min_height,
+            linked_axes=linked_axes
+        ),
+        min_height=min_height + (32 if title else 0),
+        min_width=min_width,
+        sizing_mode="stretch_width",
+        styles=styles_base,
+    )
 
-
-def apply_square_aspect_hook(plot, element):
-    """Bokeh hook: enforce square aspect ratio with width-responsive sizing."""
+def _square_responsive_bokeh_hook(plot, element):
+    """Force the rendered Bokeh figure to stay square and resize with width."""
     fig = plot.state
     fig.sizing_mode = "scale_width"
     fig.aspect_ratio = 1
     fig.match_aspect = True
 
 
-def apply_4_3_aspect_hook(plot, element):
-    """Bokeh hook: enforce 4:3 aspect ratio with width-responsive sizing."""
+def _responsive_bokeh_hook_4_3(plot, element):
+    """Force the rendered Bokeh figure to maintain 4:3 aspect ratio and resize with width."""
     fig = plot.state
     fig.sizing_mode = "scale_width"
     fig.aspect_ratio = 4 / 3
     fig.match_aspect = True
 
 
-def create_shared_range_hook(x_range, y_range):
-    """Create a HoloViews hook that assigns shared Bokeh range objects.
-
-    Used for linked spatial views.
-
-    Parameters
-    ----------
-    x_range : Range1d
-        Bokeh X-axis range
-    y_range : Range1d
-        Bokeh Y-axis range
-
-    Returns
-    -------
-    callable
-        Hook function for HoloViews plots
-    """
-    def _hook(plot, element):
-        fig = plot.state
-        fig.x_range = x_range
-        fig.y_range = y_range
-    return _hook
+def _link_spatial_axes_hook(plot, element):
+    """Mark figure as ready for linking through selection tools."""
+    fig = plot.state
+    fig._spatialplot_linked = True
 
 
-def responsive_flexbox(*children, gap: str = FLEX_GAP_DEFAULT, justify: str = "flex-start") -> pn.FlexBox:
-    """Create a wrapping flex container suitable for live and static HTML rendering.
-
-    Parameters
-    ----------
-    *children : pn.viewable.Viewable
-        Child components
-    gap : str
-        CSS gap between items
-    justify : str
-        CSS justify-content value
-
-    Returns
-    -------
-    pn.FlexBox
-        Responsive flex container
-    """
+def responsive_flexbox(*children, gap: str = "12px", justify: str = "flex-start") -> pn.FlexBox:
+    """Return a wrapping flex container that behaves well in live apps and static HTML."""
     return pn.FlexBox(
         *children,
         flex_wrap="wrap",
@@ -1106,6 +786,34 @@ def responsive_flexbox(*children, gap: str = FLEX_GAP_DEFAULT, justify: str = "f
         },
     )
 
+def _compute_shared_spatial_ranges(df: pd.DataFrame | None, pad_frac: float = 0.02):
+    """Build shared Bokeh ranges covering the global spatial extent."""
+    if df is None or df.empty or not has_cols(df, "CenterX_global_px", "CenterY_global_px"):
+        return None, None
+
+    x = safe_numeric(df["CenterX_global_px"]).dropna()
+    y = safe_numeric(df["CenterY_global_px"]).dropna()
+    if x.empty or y.empty:
+        return None, None
+
+    xmin, xmax = float(x.min()), float(x.max())
+    ymin, ymax = float(y.min()), float(y.max())
+
+    xpad = max((xmax - xmin) * pad_frac, 1.0)
+    ypad = max((ymax - ymin) * pad_frac, 1.0)
+
+    return (
+        Range1d(start=xmin - xpad, end=xmax + xpad),
+        Range1d(start=ymin - ypad, end=ymax + ypad),
+    )
+
+def _shared_range_hook(x_range, y_range):
+    """Return a HoloViews hook that assigns shared Bokeh range objects."""
+    def _hook(plot, element):
+        fig = plot.state
+        fig.x_range = x_range
+        fig.y_range = y_range
+    return _hook
 
 def flex_item(
     *objects,
@@ -1114,26 +822,7 @@ def flex_item(
     height: int | None = None,
     allow_shrink_below_min: bool = False,
 ) -> pn.Column:
-    """Wrap objects into a responsive flex item.
-
-    Parameters
-    ----------
-    *objects : pn.viewable.Viewable
-        Items to wrap
-    min_width : int
-        Minimum width in pixels
-    grow : int
-        Flex grow factor
-    height : int, optional
-        Fixed height in pixels
-    allow_shrink_below_min : bool
-        Allow shrinking below min_width (for responsive layouts)
-
-    Returns
-    -------
-    pn.Column
-        Flex item container
-    """
+    """Wrap one or more Panel objects as a responsive flex item."""
     css_min_width = "0" if allow_shrink_below_min else f"{min_width}px"
 
     kwargs = {
@@ -1149,78 +838,6 @@ def flex_item(
     return pn.Column(*objects, **kwargs)
 
 
-def compute_shared_spatial_ranges(df: pd.DataFrame | None, pad_frac: float = 0.02):
-    """Compute shared Bokeh ranges covering global spatial extent.
-
-    Adds padding for spacing around data bounds.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    pad_frac : float
-        Padding as fraction of range
-
-    Returns
-    -------
-    tuple[Range1d | None, Range1d | None]
-        (x_range, y_range) or (None, None) if insufficient data
-    """
-    if df is None or df.empty or not has_cols(df, SPATIAL_X_COL, SPATIAL_Y_COL):
-        return None, None
-
-    x = safe_numeric(df[SPATIAL_X_COL]).dropna()
-    y = safe_numeric(df[SPATIAL_Y_COL]).dropna()
-    if x.empty or y.empty:
-        return None, None
-
-    xmin, xmax = float(x.min()), float(x.max())
-    ymin, ymax = float(y.min()), float(y.max())
-
-    xpad = max((xmax - xmin) * pad_frac, 1.0)
-    ypad = max((ymax - ymin) * pad_frac, 1.0)
-
-    return (
-        Range1d(start=xmin - xpad, end=xmax + xpad),
-        Range1d(start=ymin - ypad, end=ymax + ypad),
-    )
-
-
-def maybe_sample_spatial(df: pd.DataFrame | None, enabled: bool) -> pd.DataFrame:
-    """Downsample spatial data when enabled and above memory threshold.
-
-    For large datasets, sampling improves live plot responsiveness.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset to sample
-    enabled : bool
-        Whether sampling is enabled
-
-    Returns
-    -------
-    pd.DataFrame
-        Original or sampled dataset
-    """
-    if df is None or df.empty or not enabled:
-        return df if df is not None else empty_df()
-    if len(df) <= MAX_LIVE_SPATIAL_POINTS:
-        return df
-
-    LOGGER.info(
-        "Downsampling spatial data from %s to %s rows for live rendering.",
-        len(df),
-        MAX_LIVE_SPATIAL_POINTS,
-    )
-    return df.sample(n=MAX_LIVE_SPATIAL_POINTS, random_state=42)
-
-
-
-# ============================================================================
-# UI Card & Indicator Components
-# ============================================================================
-
 
 def indicator_card(
     value: float | int | None,
@@ -1228,24 +845,7 @@ def indicator_card(
     fmt: str = "{:,.0f}",
     min_width: int = 220,
 ) -> pn.Column:
-    """Render a KPI indicator card as a flex item.
-
-    Parameters
-    ----------
-    value : float | int | None
-        Value to display (None becomes "—")
-    label : str
-        Card label
-    fmt : str
-        Python format string for value
-    min_width : int
-        Minimum width in pixels
-
-    Returns
-    -------
-    pn.Column
-        Styled indicator card
-    """
+    """Render a single KPI indicator card as a responsive flex item."""
     if value is None:
         display_value = "—"
     elif isinstance(value, (int, float)):
@@ -1290,31 +890,13 @@ def indicator_card(
         height=110,
     )
 
-
 def status_card(
     value: int,
     label: str,
     color: str,
     min_width: int = 220,
 ) -> pn.Column:
-    """Render a colored status summary card.
-
-    Parameters
-    ----------
-    value : int
-        Count value
-    label : str
-        Card label
-    color : str
-        Hex background color
-    min_width : int
-        Minimum width in pixels
-
-    Returns
-    -------
-    pn.Column
-        Styled status card
-    """
+    """Render a coloured QC status summary card as a responsive flex item."""
     html = f"""
     <div style="
         background-color:{color};
@@ -1348,25 +930,20 @@ def qc_flag_status_card(
     color: str,
     min_width: int = 220,
 ) -> pn.Column:
-    """Render a QC flag status card with count and percentage.
-
+    """Render a QC flag status card with label-number-percentage layout.
+    
     Parameters
     ----------
     value : int
-        Count of flagged items
+        Count of flagged items.
     label : str
-        Card label (e.g., "Flagged FOVs")
+        Card label (e.g., "Flagged FOVs").
     percentage : float
-        Percentage (0-100)
+        Percentage flagged (0.0 to 100.0).
     color : str
-        Hex background color
+        Hex color code for background.
     min_width : int
-        Minimum width in pixels
-
-    Returns
-    -------
-    pn.Column
-        Styled QC flag card
+        Minimum width in pixels.
     """
     html = f"""
     <div style="
@@ -1395,6 +972,21 @@ def qc_flag_status_card(
     )
 
 
+def maybe_sample_spatial(df: pd.DataFrame | None, enabled: bool) -> pd.DataFrame:
+    """Downsample spatial data when enabled and above the live-plot threshold."""
+    if df is None or df.empty or not enabled:
+        return df if df is not None else empty_df()
+    if len(df) <= MAX_LIVE_SPATIAL_POINTS:
+        return df
+
+    LOGGER.info(
+        "Downsampling spatial data from %s to %s rows for live rendering.",
+        len(df),
+        MAX_LIVE_SPATIAL_POINTS,
+    )
+    return df.sample(n=MAX_LIVE_SPATIAL_POINTS, random_state=42)
+
+
 # ============================================================================
 # Raw Plot Generation (Primitives)
 # ============================================================================
@@ -1407,26 +999,7 @@ def hist_plot_raw(
     bins: int = 50,
     xlim: tuple[float, float] | None = None,
 ) -> object | None:
-    """Create a histogram plot for a numeric column.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    column : str
-        Column name to histogram
-    title : str
-        Plot title
-    bins : int
-        Number of histogram bins
-    xlim : tuple[float, float], optional
-        X-axis limits for filtering data
-
-    Returns
-    -------
-    object | None
-        HvPlot histogram or None if column missing/invalid
-    """
+    """Create a histogram plot for a single numeric column."""
     if not has_cols(df, column):
         return None
 
@@ -1441,7 +1014,7 @@ def hist_plot_raw(
         bins=bins,
         xlabel=column,
         ylabel="Number of Cells",
-        color=ACCENT_COLOR,
+        color=ACCENT,
         **plot_kwargs(),
     )
 
@@ -1451,22 +1024,7 @@ def scatter_plot_raw(
     x: str,
     y: str,
 ) -> object | None:
-    """Create a scatter plot of two numeric columns.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    x : str
-        X-axis column name
-    y : str
-        Y-axis column name
-
-    Returns
-    -------
-    object | None
-        HvPlot scatter plot or None if columns missing/invalid
-    """
+    """Create a scatter plot for two numeric columns."""
     if not has_cols(df, x, y):
         return None
 
@@ -1479,7 +1037,7 @@ def scatter_plot_raw(
         y=y,
         xlabel=x,
         ylabel=y,
-        color=ACCENT_COLOR,
+        color=ACCENT,
         tools=PLOT_TOOLS,
         **plot_kwargs(),
     )
@@ -1491,26 +1049,10 @@ def metrics_jointplot_raw(
     y: str,
     hue: str,
 ) -> object | None:
-    """Create a hexbin plot showing cell metrics with color aggregation.
-
-    Hexagons show mean value of hue column (typically area) for better
-    performance with large cell-level datasets.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    x : str
-        X-axis column (typically nCount_RNA)
-    y : str
-        Y-axis column (typically nFeature_RNA)
-    hue : str
-        Column for hexagon color (typically Area.um2)
-
-    Returns
-    -------
-    object | None
-        HvPlot hexbin or None if columns missing/invalid
+    """Create a hexbin plot showing cell metrics.
+    
+    Shows X (nCount_RNA) vs Y (nFeature_RNA) with hexes colored by mean hue (Area.um2).
+    Hexagons are aggregated with mean area for better performance with large datasets.
     """
     if not has_cols(df, x, y, hue):
         return None
@@ -1524,6 +1066,7 @@ def metrics_jointplot_raw(
     if plot_df.empty:
         return None
 
+    # Create hexbin plot with mean color aggregation
     hexbin = plot_df.hvplot.hexbin(
         x=x,
         y=y,
@@ -1540,68 +1083,30 @@ def metrics_jointplot_raw(
         **plot_kwargs(),
     )
 
+    # Apply responsive options with 4:3 aspect ratio
     return hexbin.opts(
         toolbar="above",
         active_tools=["wheel_zoom"],
         responsive=True,
         data_aspect=4 / 3,
-        hooks=[apply_4_3_aspect_hook],
+        hooks=[_responsive_bokeh_hook_4_3],
     ).clone()
 
 
-
-# ============================================================================
-# Color Utilities & Normalization
-# ============================================================================
-
-
-def sample_matplotlib_palette(name: str = "RdYlGn", n: int = 256) -> list[str]:
-    """Sample hex colors from a Matplotlib colormap.
-
-    Parameters
-    ----------
-    name : str
-        Matplotlib colormap name
-    n : int
-        Number of colors to sample
-
-    Returns
-    -------
-    list[str]
-        List of hex color codes
-    """
+def _matplotlib_palette(name: str = "RdYlGn", n: int = 256) -> list[str]:
+    """Return a list of hex colours sampled from a Matplotlib colormap."""
     cmap = cm.get_cmap(name, n)
     return [mcolors.to_hex(cmap(i)) for i in range(cmap.N)]
 
 
-def normalize_values_with_center(
+def _two_slope_normalize_series(
     values: pd.Series,
     *,
     vmin: float,
     vcenter: float,
     vmax: float,
 ) -> pd.Series:
-    """Normalize values to [0,1] with center point fixed at 0.5.
-
-    Mimics matplotlib's TwoSlopeNorm for diverging colormaps.
-    Useful for emphasizing midpoint differences in data.
-
-    Parameters
-    ----------
-    values : pd.Series
-        Values to normalize
-    vmin : float
-        Minimum value (maps to 0.0)
-    vcenter : float
-        Center value (maps to 0.5) 
-    vmax : float
-        Maximum value (maps to 1.0)
-
-    Returns
-    -------
-    pd.Series
-        Normalized values [0, 1]
-    """
+    """Map values to [0,1] with vcenter fixed at 0.5, mimicking TwoSlopeNorm."""
     s = pd.to_numeric(values, errors="coerce").astype(float)
     out = pd.Series(np.nan, index=s.index, dtype=float)
 
@@ -1628,11 +1133,10 @@ def normalize_values_with_center(
     return out.clip(0, 1)
 
 
-def update_fov_scatter_colorbar_labels(plot, element):
-    """Bokeh hook: relabel [0,1] colorbar ticks back to median RNA units.
-    
-    Compensates for two-slope normalization by restoring original value labels.
-    """
+def _fov_scatter_colorbar_relabel_hook(plot, element):
+    """Relabel normalized [0,1] colorbar ticks back into median RNA units."""
+    from bokeh.models import ColorBar, FixedTicker, CustomJSTickFormatter
+
     fig = plot.state
     data = element.data
     if data is None or len(data) == 0:
@@ -1676,58 +1180,45 @@ def update_fov_scatter_colorbar_labels(plot, element):
         cb.title = "Median RNA/FOV"
 
 
-def build_fov_scatter_plot(
+def fov_scatter_plot_raw(
     df: pd.DataFrame | None,
     extra_hooks: list | None = None,
 ) -> object | None:
-    """Create FOV-level scatter plot with diverging colormap centered at 48.
 
-    Shows FOV positions colored by median RNA, with bubble size representing
-    the ratio of negative probes to RNA. Uses two-slope normalization for
-    better emphasis of values near the center.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Cell-level dataset
-    extra_hooks : list, optional
-        Additional Bokeh hooks to apply
-
-    Returns
-    -------
-    object | None
-        HvPlot points or None if data insufficient
-    """
+    """Create a FOV-level scatter plot with Matplotlib-like diverging colour mapping centered at 48."""
     if df is None or df.empty:
         return None
 
     fov_col = find_column(df, "fov", "FOV", "field_of_view", "fieldofview")
-    x_col, y_col = SPATIAL_X_COL, SPATIAL_Y_COL
+    x_col = "CenterX_global_px"
+    y_col = "CenterY_global_px"
     ncount_rna_col = find_column(df, "nCount_RNA", "ncountrna", "count_rna")
     ncount_negprobes_col = find_column(df, "nCount_negprobes", "ncountnegprobes", "count_negprobes")
 
     if not all([fov_col, x_col in df.columns, y_col in df.columns, ncount_rna_col]):
         return None
 
-    # Prepare data
     work = df.copy()
-    work[[x_col, y_col, ncount_rna_col]] = work[[x_col, y_col, ncount_rna_col]].apply(safe_numeric)
+    work[x_col] = safe_numeric(work[x_col])
+    work[y_col] = safe_numeric(work[y_col])
+    work[ncount_rna_col] = safe_numeric(work[ncount_rna_col])
+
     if ncount_negprobes_col:
         work[ncount_negprobes_col] = safe_numeric(work[ncount_negprobes_col])
+
     work = work.dropna(subset=[fov_col, x_col, y_col, ncount_rna_col])
     if work.empty:
         return None
 
-    # Aggregate to FOV level
     median_rna_col = find_column(work, "median_RNA", "medianrna", "median_rna")
+    
     fov_data = work.groupby(fov_col).agg({
-        x_col: "mean",
-        y_col: "mean",
-        median_rna_col: "first",
-    }).reset_index()
+            x_col: "mean",
+            y_col: "mean",
+            median_rna_col: "first",
+        }).reset_index()
     fov_data.columns = ["fov", "spatial_fov_x", "spatial_fov_y", "median_rna"]
 
-    # Compute bubble size from negative probes ratio
     if ncount_negprobes_col and ncount_negprobes_col in work.columns:
         negprobe_stats = work.groupby(fov_col)[ncount_negprobes_col].median()
         rna_stats = work.groupby(fov_col)[ncount_rna_col].median()
@@ -1740,38 +1231,59 @@ def build_fov_scatter_plot(
     if fov_data.empty:
         return None
 
-    # Scale bubble sizes
-    ratio_min, ratio_max = fov_data["ratio_negprobes"].min(), fov_data["ratio_negprobes"].max()
+    ratio_min = fov_data["ratio_negprobes"].min()
+    ratio_max = fov_data["ratio_negprobes"].max()
     ratio_range = ratio_max - ratio_min if ratio_max > ratio_min else 1.0
     fov_data["bubble_size"] = 10 + 10 * (fov_data["ratio_negprobes"] - ratio_min) / ratio_range
 
-    # Prepare colormap with center-biased normalization
-    display_min, display_max = FOV_MEDIAN_RNA_DISPLAY_MIN, FOV_MEDIAN_RNA_DISPLAY_MAX
+    vcenter = 48.0
+    # Recommended: robust upper cap for display
+    # Change 0.99 to 1.0 if you want exact full-range behaviour
+    # upper_q = 0.66
+    # display_max = float(fov_data["median_rna"].quantile(upper_q))
+    # display_max = max(display_max, vcenter + 1e-9)
+    display_max = vcenter*3
+    display_min = vcenter/3
     fov_data["color_vmin"] = display_min
     fov_data["color_vmax"] = display_max
-    fov_data["color_vcenter"] = FOV_MEDIAN_RNA_CENTER
+    fov_data["color_vcenter"] = vcenter
+
+
+    # Clip only for DISPLAY; keep true values in hover
     fov_data["median_rna_display"] = fov_data["median_rna"].clip(lower=display_min, upper=display_max)
-    fov_data["median_rna_twoslope"] = normalize_values_with_center(
+
+    fov_data["median_rna_twoslope"] = _two_slope_normalize_series(
         fov_data["median_rna_display"],
         vmin=display_min,
-        vcenter=FOV_MEDIAN_RNA_CENTER,
+        vcenter=vcenter,
         vmax=display_max,
     )
 
-    # Create HoloViews points
-    palette = sample_matplotlib_palette("RdYlGn", 256)
+    palette = _matplotlib_palette("RdYlGn", 256)
+
+
     points = hv.Points(
         fov_data,
         kdims=["spatial_fov_x", "spatial_fov_y"],
         vdims=[
-            "fov", "median_rna", "median_rna_display", "median_rna_twoslope",
-            "ratio_negprobes", "bubble_size",
-            "color_vmin", "color_vmax", "color_vcenter",
+            "fov",
+            "median_rna",
+            "median_rna_display",
+            "median_rna_twoslope",
+            "ratio_negprobes",
+            "bubble_size",
+            "color_vmin",
+            "color_vmax",
+            "color_vcenter",
         ],
     )
 
-    # Apply rendering hooks
-    hooks = [apply_square_aspect_hook, update_fov_scatter_colorbar_labels]
+
+
+    hooks = [
+        _square_responsive_bokeh_hook,
+        _fov_scatter_colorbar_relabel_hook,
+    ]
     if extra_hooks:
         hooks.extend(extra_hooks)
 
@@ -1798,34 +1310,16 @@ def build_fov_scatter_plot(
 
 
 
-def build_spatial_plot(
+def spatial_plot(
     df: pd.DataFrame | None,
     color_by: str = DEFAULT_SPATIAL_COLOR_BY,
     sample: bool = False,
     extra_hooks: list | None = None,
 ) -> pn.viewable.Viewable:
-    """Build a spatial hexbin plot colored by a selected column.
 
-    Supports both numeric (viridis colormap) and categorical (custom palette)
-    columns. Automatically downsamples large datasets for responsive rendering.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset with spatial coordinates (SPATIAL_X_COL, SPATIAL_Y_COL)
-    color_by : str
-        Column name for hexagon color
-    sample : bool
-        Whether to downsample for live plotting
-    extra_hooks : list, optional
-        Additional Bokeh hooks
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Plot container or error message
-    """
-    x_col, y_col = SPATIAL_X_COL, SPATIAL_Y_COL
+    """Create a spatial hexbin plot coloured by a selected column."""
+    x_col = "CenterX_global_px"
+    y_col = "CenterY_global_px"
 
     if not has_cols(df, x_col, y_col):
         return panel_message("No spatial data available.")
@@ -1851,7 +1345,6 @@ def build_spatial_plot(
     mode = classify_color_column(df[color_by])
 
     if mode == "numeric":
-        # Numeric color encoding with continuous colormap
         plot_df[color_by] = safe_numeric(plot_df[color_by])
         plot_df = plot_df.dropna(subset=[color_by])
 
@@ -1877,10 +1370,8 @@ def build_spatial_plot(
             **plot_kwargs(),
         )
     else:
-        # Categorical color encoding with custom palette
         cat = plot_df[color_by].astype("string").fillna("Missing")
 
-        # Limit categories to top N with "Other" catch-all
         if cat.nunique() > MAX_SPATIAL_CATEGORIES:
             top = set(cat.value_counts().nlargest(MAX_SPATIAL_CATEGORIES - 1).index)
             cat = cat.where(cat.isin(top), "Other")
@@ -1912,7 +1403,9 @@ def build_spatial_plot(
             **plot_kwargs(),
         )
 
-    hooks = [apply_square_aspect_hook]
+
+
+    hooks = [_square_responsive_bokeh_hook]
     if extra_hooks:
         hooks.extend(extra_hooks)
 
@@ -1926,23 +1419,10 @@ def build_spatial_plot(
     ).clone()
 
 
-
-
 def compute_fov_cell_qc_flags(df: pd.DataFrame | None) -> dict[str, int | float]:
-    """Compute FOV-level and cell-level QC flags from thresholds.
-
-    Counts FOVs with median_RNA < QC_FOV_THRESHOLD and cells with
-    nCount_RNA < QC_CELL_THRESHOLD.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-
-    Returns
-    -------
-    dict[str, int | float]
-        QC flag statistics including flagged counts and totals
+    """Compute FOV and cell QC flags based on median_RNA and nCount_RNA thresholds.
+    
+    Flags FOVs with median_RNA < 24 and cells with nCount_RNA < 20.
     """
     if df is None or df.empty:
         return {
@@ -1959,38 +1439,38 @@ def compute_fov_cell_qc_flags(df: pd.DataFrame | None) -> dict[str, int | float]
         "total_cells": 0,
     }
 
-    # FOV-level flags
+    # FOV-level flags based on median_RNA
     fov_col = find_column(df, "fov", "FOV", "field_of_view", "fieldofview")
     median_rna_col = find_column(df, "median_RNA", "medianrna", "median_rna")
 
     if fov_col is not None and median_rna_col is not None:
         fov_stats = df.groupby(fov_col)[median_rna_col].median()
         result["total_fovs"] = len(fov_stats)
-        result["flagged_fovs"] = int((fov_stats < QC_FOV_THRESHOLD).sum())
+        result["flagged_fovs"] = int((fov_stats < 24).sum())
 
-    # Cell-level flags
+    # Cell-level flags based on nCount_RNA
     ncount_rna_col = find_column(df, "nCount_RNA", "ncountrna", "count_rna")
     if ncount_rna_col is not None:
         result["total_cells"] = len(df)
-        result["flagged_cells"] = int((safe_numeric(df[ncount_rna_col]) < QC_CELL_THRESHOLD).sum())
+        result["flagged_cells"] = int((safe_numeric(df[ncount_rna_col]) < 20).sum())
 
     return result
 
 
 def get_qc_flag_color(ratio: float, flag_type: str) -> str:
-    """Determine QC flag card color based on flag ratio and type-specific thresholds.
-
+    """Determine QC flag card color based on ratio and thresholds.
+    
     Parameters
     ----------
     ratio : float
-        Fraction of flagged items (0.0 to 1.0)
+        Fraction of flagged items (0.0 to 1.0).
     flag_type : str
-        Either "fov" or "cell" for different thresholds
-
+        Either 'fov' or 'cell' to use appropriate thresholds.
+    
     Returns
     -------
     str
-        Hex color code (green, orange, or red)
+        Hex color code.
     """
     if flag_type == "fov":
         if ratio < 0.2:
@@ -2009,20 +1489,8 @@ def get_qc_flag_color(ratio: float, flag_type: str) -> str:
     return "#6b7280"  # gray default
 
 
-
-def create_qc_flag_status_display(df: pd.DataFrame | None) -> pn.viewable.Viewable:
-    """Create KPI cards displaying QC flag statistics.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Responsive flex display with QC flag cards
-    """
+def create_qc_flag_cards(df: pd.DataFrame | None) -> pn.viewable.Viewable:
+    """Create QC flagging status cards for FOVs and cells."""
     flags = compute_fov_cell_qc_flags(df)
 
     fov_ratio = flags["flagged_fovs"] / flags["total_fovs"] if flags["total_fovs"] > 0 else 0.0
@@ -2047,24 +1515,8 @@ def create_qc_flag_status_display(df: pd.DataFrame | None) -> pn.viewable.Viewab
     )
 
 
-def create_qc_flag_cards(df: pd.DataFrame | None) -> pn.viewable.Viewable:
-    """Deprecated alias for create_qc_flag_status_display. Use new name."""
-    return create_qc_flag_status_display(df)
-
-
 def create_indicators(stats: dict[str, float | int | None]) -> pn.viewable.Viewable:
-    """Create KPI indicator cards for the filtered dataset.
-
-    Parameters
-    ----------
-    stats : dict[str, float | int | None]
-        Statistics dictionary with keys like cell_count, median_rna, etc.
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Responsive flex display with indicator cards
-    """
+    """Create a responsive KPI layout for the selected dataset slice."""
     if not stats:
         return panel_message("No data available.")
 
@@ -2077,8 +1529,8 @@ def create_indicators(stats: dict[str, float | int | None]) -> pn.viewable.Viewa
 
 
 
-def build_empty_tabulator() -> pn.widgets.Tabulator:
-    """Create an empty Tabulator widget with standard configuration."""
+def _empty_tabulator() -> pn.widgets.Tabulator:
+    """Return an empty Tabulator with the standard dashboard configuration."""
     return pn.widgets.Tabulator(
         empty_df(),
         sizing_mode="stretch_width",
@@ -2087,29 +1539,23 @@ def build_empty_tabulator() -> pn.widgets.Tabulator:
     )
 
 
-def build_qc_metrics_table(df: pd.DataFrame | None) -> pn.widgets.Tabulator:
-    """Build a tabular FOV QC summary from cell-level or pre-computed data.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Cell-level or FOV-level dataset
-
-    Returns
-    -------
-    pn.widgets.Tabulator
-        FOV metrics table
-    """
+def create_qc_metrics_table(df: pd.DataFrame | None) -> pn.widgets.Tabulator:
+    """Create a tabular FOV QC summary from precomputed or derived metrics."""
     if df is None or df.empty:
-        return build_empty_tabulator()
+        return _empty_tabulator()
 
     fov_col = find_column(df, "fov", "FOV", "field_of_view", "fieldofview")
     if fov_col is None:
-        return build_empty_tabulator()
+        return _empty_tabulator()
 
     candidate_cols = [
-        "nCell", "nCount", "nCountPerCell", "nFeaturePerCell",
-        "propNegativeCellAvg", "complexityCellAvg", "qcFlagsFOV",
+        "nCell",
+        "nCount",
+        "nCountPerCell",
+        "nFeaturePerCell",
+        "propNegativeCellAvg",
+        "complexityCellAvg",
+        "qcFlagsFOV",
     ]
 
     resolved = {"fov": fov_col}
@@ -2132,10 +1578,11 @@ def build_qc_metrics_table(df: pd.DataFrame | None) -> pn.widgets.Tabulator:
 
     summary = compute_fov_summary(df)
     if summary is None or summary.empty or "fov" not in summary.columns:
-        return build_empty_tabulator()
+        return _empty_tabulator()
 
     display_cols = [
-        c for c in ["fov", "nCell", "nCount", "nCountPerCell", "nFeaturePerCell", "Area"]
+        c
+        for c in ["fov", "nCell", "nCount", "nCountPerCell", "nFeaturePerCell", "Area"]
         if c in summary.columns
     ]
 
@@ -2144,24 +1591,15 @@ def build_qc_metrics_table(df: pd.DataFrame | None) -> pn.widgets.Tabulator:
     return pn.widgets.Tabulator(
         fov_metrics.sort_index(),
         sizing_mode="stretch_width",
+        # height=552,
         pagination="local",
         page_size=TABLE_PAGE_SIZE,
     )
 
 
+
+
 def create_qc_flags_summary(df: pd.DataFrame | None) -> pn.Column:
-    """Create a QC status summary section with bar chart and status cards.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-
-    Returns
-    -------
-    pn.Column
-        QC summary display
-    """
     if df is None or df.empty or not has_cols(df, "qcCellsPassed", "qcCellsFlagged"):
         return pn.Column(
             pn.pane.Markdown("No QC summary data available."),
@@ -2194,22 +1632,8 @@ def create_qc_flags_summary(df: pd.DataFrame | None) -> pn.Column:
         sizing_mode="stretch_width",
     )
 
-
 def create_status_pane(message: str, level: str) -> pn.pane.Pane:
-    """Create a status alert pane.
-
-    Parameters
-    ----------
-    message : str
-        Status message
-    level : str
-        Alert level (info, success, warning, danger)
-
-    Returns
-    -------
-    pn.pane.Pane
-        Alert pane or empty spacer if no message
-    """
+    """Create the top-level status alert pane."""
     if not message:
         return pn.Spacer(height=0)
     return pn.pane.Alert(message, alert_type=level, sizing_mode="stretch_width")
@@ -2220,7 +1644,7 @@ def create_status_pane(message: str, level: str) -> pn.pane.Pane:
 # ============================================================================
 
 
-def build_boxed_histogram(
+def _boxed_hist(
     df: pd.DataFrame | None,
     column: str,
     title: str,
@@ -2229,35 +1653,14 @@ def build_boxed_histogram(
     xlim: tuple[float, float] | None = None,
     min_height: int = PLOT_MIN_HEIGHT,
 ) -> pn.viewable.Viewable:
-    """Build a boxed histogram plot with fallback messaging.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    column : str
-        Column to histogram
-    title : str
-        Plot title
-    bins : int
-        Histogram bins
-    xlim : tuple[float, float], optional
-        X-axis limits
-    min_height : int
-        Minimum height
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Plot container or error message
-    """
+    """Create a boxed histogram plot with title and fallback messaging."""
     plot = hist_plot_raw(df, column, title, bins=bins, xlim=xlim)
     if plot is None:
         return panel_message(f"No {title.lower()} data available.")
     return plot_box(plot, min_height=min_height, title=title)
 
 
-def build_boxed_scatter(
+def _boxed_scatter(
     df: pd.DataFrame | None,
     x: str,
     y: str,
@@ -2265,33 +1668,14 @@ def build_boxed_scatter(
     *,
     min_height: int = PLOT_MIN_HEIGHT,
 ) -> pn.viewable.Viewable:
-    """Build a boxed scatter plot with fallback messaging.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    x : str
-        X-axis column
-    y : str
-        Y-axis column
-    title : str
-        Plot title
-    min_height : int
-        Minimum height
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Plot container or error message
-    """
+    """Create a boxed scatter plot with title and fallback messaging."""
     plot = scatter_plot_raw(df, x, y)
     if plot is None:
         return panel_message("No comparison data available.")
     return plot_box(plot, min_height=min_height, title=title)
 
 
-def build_boxed_metrics_plot(
+def _boxed_metrics_jointplot(
     df: pd.DataFrame | None,
     x: str,
     y: str,
@@ -2300,66 +1684,30 @@ def build_boxed_metrics_plot(
     *,
     min_height: int = PLOT_TALL_MIN_HEIGHT,
 ) -> pn.viewable.Viewable:
-    """Build a boxed metrics hexbin plot with fallback messaging.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    x : str
-        X-axis column
-    y : str
-        Y-axis column
-    hue : str
-        Color column
-    title : str
-        Plot title
-    min_height : int
-        Minimum height
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Plot container or error message
-    """
+    """Create a boxed metrics scatter plot with fallback messaging."""
     plot = metrics_jointplot_raw(df, x, y, hue)
     if plot is None:
         return panel_message("No metrics data available.")
     return plot_box(plot, min_height=min_height, max_width=800, title=title)
 
 
-def build_linked_spatial_views(
+def _boxed_linked_spatial_views(
     df: pd.DataFrame | None,
     color_by: str,
     *,
     report_mode: bool,
 ) -> pn.viewable.Viewable:
-    """Build responsive side-by-side spatial views with shared ranges.
-
-    Parameters
-    ----------
-    df : pd.DataFrame | None
-        Dataset
-    color_by : str
-        Column for spatial plot color
-    report_mode : bool
-        If True, disable sampling for complete static report
-
-    Returns
-    -------
-    pn.viewable.Viewable
-        Flex container with two linked spatial visualizations
-    """
+    """Create responsive side-by-side spatial views with truly shared Bokeh ranges and 4:3 aspect ratio."""
     if df is None or df.empty:
         return panel_message("No spatial data available.")
 
-    x_range, y_range = compute_shared_spatial_ranges(df)
+    x_range, y_range = _compute_shared_spatial_ranges(df)
     extra_hooks = []
     if x_range is not None and y_range is not None:
-        extra_hooks.append(create_shared_range_hook(x_range, y_range))
+        extra_hooks.append(_shared_range_hook(x_range, y_range))
 
-    fov_plot = build_fov_scatter_plot(df, extra_hooks=extra_hooks)
-    spatial = build_spatial_plot(
+    fov_plot = fov_scatter_plot_raw(df, extra_hooks=extra_hooks)
+    spatial = spatial_plot(
         df,
         color_by=color_by,
         sample=not report_mode,
@@ -2382,7 +1730,7 @@ def build_linked_spatial_views(
             grow=1,
             allow_shrink_below_min=True,
         ),
-        gap=FLEX_GAP_WIDE,
+        gap="16px",
     )
 
 
@@ -2401,32 +1749,32 @@ def make_component_bindings(report_mode: bool = False) -> dict[str, object]:
 
         # Summary tab - combined linked spatial views
         "linked_spatial_views": pn.bind(
-            build_linked_spatial_views,
+            _boxed_linked_spatial_views,
             filtered_df,
             color_by_select,
             report_mode=report_mode,
         ),
-        "qc_metrics_tbl": pn.bind(build_qc_metrics_table, filtered_df),
+        "qc_metrics_tbl": pn.bind(create_qc_metrics_table, filtered_df),
 
         # Sequencing tab – QC
         "qc_flags_plot": pn.bind(create_qc_flags_summary, filtered_df),
 
         # Sequencing tab – Negative probes
         "negprobes_hist": pn.bind(
-            build_boxed_histogram,
+            _boxed_hist,
             filtered_df,
             "nCount_negprobes",
             "Negative Probes Count Distribution",
         ),
         "rna_vs_negprobes": pn.bind(
-            build_boxed_scatter,
+            _boxed_scatter,
             filtered_df,
             "nCount_RNA",
             "nCount_negprobes",
             "RNA Count vs Negative Probes",
         ),
         "propnegative_hist": pn.bind(
-            build_boxed_histogram,
+            _boxed_hist,
             filtered_df,
             "propNegative",
             "Proportion Negative",
@@ -2436,7 +1784,7 @@ def make_component_bindings(report_mode: bool = False) -> dict[str, object]:
 
         # Cell segmentation / sequencing metrics
         "metrics_jointplot": pn.bind(
-            build_boxed_metrics_plot,
+            _boxed_metrics_jointplot,
             filtered_df,
             "nCount_RNA",
             "nFeature_RNA",
@@ -2444,19 +1792,19 @@ def make_component_bindings(report_mode: bool = False) -> dict[str, object]:
             "Cell Metrics Summary",
         ),
         "rna_hist": pn.bind(
-            build_boxed_histogram,
+            _boxed_hist,
             filtered_df,
             "nCount_RNA",
             "RNA Count Distribution",
         ),
         "feature_hist": pn.bind(
-            build_boxed_histogram,
+            _boxed_hist,
             filtered_df,
             "nFeature_RNA",
             "Feature Count Distribution",
         ),
         "area_hist": pn.bind(
-            build_boxed_histogram,
+            _boxed_hist,
             filtered_df,
             "Area.um2",
             "Cell Area Distribution",

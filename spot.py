@@ -167,6 +167,24 @@ def classify_color_column(series: pd.Series) -> str:
     return "numeric" if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series) else "categorical"
 
 
+def get_marker_columns(df: pd.DataFrame | None) -> list[str]:
+    if df is None or df.empty:
+        return []
+
+    marker_preffix = "Mean."
+    max_cols = [c for c in df.columns if c.startswith(marker_preffix)]
+    if not max_cols:
+        return []
+
+    # Ensure DAPI is always first
+    if f"{marker_preffix}DAPI" in max_cols:
+        max_cols = [f"{marker_preffix}DAPI"] + sorted(c for c in max_cols if c != f"{marker_preffix}DAPI")
+    else:
+        max_cols = sorted(max_cols)
+
+    return max_cols
+
+
 def get_first_csv_path(data_dir: Path = DATA_DIR) -> Path | None:
     if not data_dir.exists() or not data_dir.is_dir():
         return None
@@ -936,6 +954,53 @@ def build_linked_spatial_views(df: pd.DataFrame | None, color_by: str, *, report
         gap=FLEX_GAP_WIDE,
     )
 
+def build_image_qc_spatial_views(
+    df: pd.DataFrame | None,
+    *,
+    report_mode: bool,
+) -> pn.viewable.Viewable:
+    """Build linked spatial plots for all Max.* image QC channels."""
+
+    if df is None or df.empty:
+        return panel_message("No image QC data available.")
+
+    max_cols = get_marker_columns(df)
+    if not max_cols:
+        return panel_message("No marker columns found.")
+
+    # Shared spatial ranges
+    x_range, y_range = compute_shared_spatial_ranges(df)
+    extra_hooks = []
+    if x_range is not None and y_range is not None:
+        extra_hooks.append(create_shared_range_hook(x_range, y_range))
+
+    plots = []
+    for col in max_cols:
+        plot = build_spatial_plot(
+            df,
+            color_by=col,
+            sample=not report_mode,
+            extra_hooks=extra_hooks,
+        )
+
+        plots.append(
+            pn.Column(
+                plot_box(
+                    plot,
+                    aspect_ratio=1,
+                    min_width=PLOT_PANEL_MIN_WIDTH,
+                    title=col,
+                ),
+                sizing_mode="stretch_width",
+                min_width=PLOT_PANEL_MIN_WIDTH,
+                styles={
+                    "flex": f"1 1 {PLOT_PANEL_MIN_WIDTH}px",
+                    "max-width": f"{PLOT_PANEL_MIN_WIDTH * 1.5}px",
+                },
+            )
+        )
+
+    return responsive_flexbox(*plots, gap=FLEX_GAP_WIDE)
 
 def make_component_bindings(report_mode: bool = False) -> dict[str, object]:
     return {
@@ -950,6 +1015,8 @@ def make_component_bindings(report_mode: bool = False) -> dict[str, object]:
         "rna_hist": pn.bind(build_boxed_histogram, filtered_df, "nCount_RNA", ""),
         "feature_hist": pn.bind(build_boxed_histogram, filtered_df, "nFeature_RNA", ""),
         "area_hist": pn.bind(build_boxed_histogram, filtered_df, "Area.um2", ""),
+        "image_qc_spatial": pn.bind(build_image_qc_spatial_views, filtered_df, report_mode=report_mode,
+        ),
     }
 
 
@@ -989,10 +1056,10 @@ def build_details_tab(views: Mapping[str, object]) -> pn.Column:
     )
 
 
-def build_image_qc_tab() -> pn.Column:
+def build_image_qc_tab(views: Mapping[str, object]) -> pn.Column:
     return pn.Column(
         pn.pane.Markdown("### Fluorescent Markers"),
-        pn.pane.Markdown("Work in progress"),
+        views["image_qc_spatial"], #This should already return the dynamic flexbox
         sizing_mode="stretch_both",
         styles={"overflow-y": "auto"},
     )
@@ -1001,6 +1068,7 @@ def build_image_qc_tab() -> pn.Column:
 def build_analysis_tab() -> pn.Column:
     return pn.Column(
         pn.pane.Markdown("### DR and clustering based on metadata information"),
+        pn.pane.Markdown("Work in progress"),
         sizing_mode="stretch_both",
         styles={"overflow-y": "auto"},
     )
@@ -1010,7 +1078,7 @@ def create_tabs(views: Mapping[str, object], report_mode: bool = False) -> pn.Ta
     return pn.Tabs(
         ("Summary", build_summary_tab(views)),
         ("Run Details", build_details_tab(views)),
-        ("Image QC", build_image_qc_tab()),
+        ("Image QC", build_image_qc_tab(views)),
         ("Analysis", build_analysis_tab()),
         dynamic=not report_mode,
         styles=CARD_STYLES,

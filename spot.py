@@ -1109,7 +1109,9 @@ def create_template(report_mode: bool = False) -> pn.template.BootstrapTemplate:
     main = [pn.Column(title_pane(), tabs, sizing_mode="stretch_both")]
     if report_mode:
         return pn.template.BootstrapTemplate(
-            title="POPIDD-SPOT: Spatial Profiling Overview Tool [STATIC]",
+            title="Spatial Profiling Overview Tool [STATIC]",
+            site="POPIDD-SPOT",
+            site_url="https://github.com/IntegratedPathologyUnit-ICR/popidd-spot",
             header_background="#d4a300",
             main=main,
         )
@@ -1131,7 +1133,9 @@ def create_template(report_mode: bool = False) -> pn.template.BootstrapTemplate:
     ]
 
     return pn.template.BootstrapTemplate(
-        title="POPIDD-SPOT: Spatial Profiling Overview Tool [LIVE]",
+        title="Spatial Profiling Overview Tool [LIVE]",
+        site="POPIDD-SPOT",
+        site_url="https://github.com/IntegratedPathologyUnit-ICR/popidd-spot",
         sidebar=sidebar_items,
         collapsed_sidebar=True,
         header_background="#d4a300",

@@ -21,7 +21,8 @@ from holoviews import dim
 from matplotlib import cm, colors as mcolors
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import HDBSCAN
+from sklearn.cluster import MiniBatchKMeans
+
 
 
 pn.extension("tabulator", "filedropper", design="bootstrap", theme="default")
@@ -83,6 +84,26 @@ QC_FOV_THRESHOLD = 42
 FOV_MEDIAN_RNA_CENTER = 56
 FOV_MEDIAN_RNA_DISPLAY_MIN = FOV_MEDIAN_RNA_CENTER / 2
 FOV_MEDIAN_RNA_DISPLAY_MAX = FOV_MEDIAN_RNA_CENTER * 3
+
+
+# MiniBatchKMeans defaults
+KMEANS_N_CLUSTERS_DEFAULT = 6
+KMEANS_N_CLUSTERS_MIN = 2
+KMEANS_N_CLUSTERS_MAX = 50
+KMEANS_N_CLUSTERS_STEP = 1
+
+N_CPU_CORES = os.cpu_count() or 1
+KMEANS_BATCH_SIZE_MIN = 1_024
+KMEANS_BATCH_SIZE_MAX = 65_536
+KMEANS_BATCH_SIZE_STEP = 1_024
+KMEANS_BATCH_SIZE_DEFAULT = max(8_192, 256 * N_CPU_CORES)
+KMEANS_BATCH_SIZE_DEFAULT = min(KMEANS_BATCH_SIZE_DEFAULT, 65_536)
+
+KMEANS_MAX_ITER_DEFAULT = 100
+KMEANS_MAX_ITER_MIN = 20
+KMEANS_MAX_ITER_MAX = 300
+KMEANS_MAX_ITER_STEP = 10
+
 
 PLOT_TOOLS = ["hover", "box_select", "lasso_select", "reset"]
 
@@ -212,31 +233,38 @@ def get_marker_columns_extended(df: pd.DataFrame | None) -> list[str]:
     return mean_cols + max_cols
 
 
-def prepare_marker_data_for_pca(df: pd.DataFrame | None, marker_cols: list[str]) -> pd.DataFrame:
-    """Prepare marker data for PCA by extracting, standardizing, and dropping NaN rows."""
+def prepare_marker_matrix_for_analysis(
+    df: pd.DataFrame | None,
+    marker_cols: list[str],
+) -> tuple[np.ndarray, pd.Index, list[str]]:
+    """Return complete-case numeric marker matrix, source row index, and valid marker columns."""
     if df is None or df.empty or not marker_cols:
-        return empty_df()
-    
-    # Check that all marker columns exist
-    missing_cols = [c for c in marker_cols if c not in df.columns]
-    if missing_cols:
-        LOGGER.warning("Missing marker columns: %s", missing_cols)
-        marker_cols = [c for c in marker_cols if c in df.columns]
-    
-    if not marker_cols:
-        return empty_df()
-    
-    # Extract marker data
-    work = df.loc[:, marker_cols].copy()
-    
-    # Convert to numeric
-    for col in work.columns:
-        work[col] = safe_numeric(work[col])
-    
-    # Drop rows with any NaN in marker columns (strict approach)
-    work = work.dropna()
-    
-    return work
+        return np.empty((0, 0), dtype=np.float32), pd.Index([]), []
+
+    marker_cols = [c for c in marker_cols if c in df.columns]
+    if len(marker_cols) < 2:
+        return np.empty((0, 0), dtype=np.float32), pd.Index([]), []
+
+    work = df.loc[:, marker_cols]
+
+    numeric_parts = []
+    for c in marker_cols:
+        s = work[c]
+        if pd.api.types.is_numeric_dtype(s):
+            numeric_parts.append(s.astype("float32", copy=False))
+        else:
+            numeric_parts.append(pd.to_numeric(s, errors="coerce").astype("float32"))
+
+    numeric_df = pd.concat(numeric_parts, axis=1)
+    numeric_df.columns = marker_cols
+
+    # Strict complete-case filtering: drop any row with any missing marker value.
+    numeric_df = numeric_df.dropna(axis=0, how="any")
+
+    if numeric_df.empty:
+        return np.empty((0, 0), dtype=np.float32), pd.Index([]), []
+
+    return numeric_df.to_numpy(dtype=np.float32, copy=False), numeric_df.index, marker_cols
 
 
 def get_first_csv_path(data_dir: Path = DATA_DIR) -> Path | None:
@@ -267,7 +295,6 @@ def clear_data_caches() -> None:
     cached_fov_summary.cache_clear()
     cached_filtered_df.cache_clear()
     cached_cell_stats.cache_clear()
-    cached_pca_clustering.cache_clear()
     _column_lookup.cache_clear()
 
 
@@ -377,20 +404,29 @@ color_by_select = pn.widgets.Select(
 export_html_button = pn.widgets.Button(name="Export HTML Report", button_type="success", icon="download")
 export_csv_button = pn.widgets.Button(name="Export Data (CSV)", button_type="success", icon="download")
 
-# HDBSCAN clustering parameters
-hdbscan_min_cluster_size_slider = pn.widgets.IntSlider(
-    name="HDBSCAN: min_cluster_size",
-    start=2,
-    end=50,
-    value=15,
-    step=1,
+# Fast clustering parameters
+kmeans_n_clusters_slider = pn.widgets.IntSlider(
+  name="MiniBatchKMeans: n_clusters",
+  start=KMEANS_N_CLUSTERS_MIN,
+  end=KMEANS_N_CLUSTERS_MAX,
+  value=KMEANS_N_CLUSTERS_DEFAULT,
+  step=KMEANS_N_CLUSTERS_STEP,
 )
-hdbscan_min_samples_slider = pn.widgets.IntSlider(
-    name="HDBSCAN: min_samples",
-    start=1,
-    end=50,
-    value=5,
-    step=1,
+
+kmeans_batch_size_slider = pn.widgets.IntSlider(
+  name="MiniBatchKMeans: batch_size",
+  start=KMEANS_BATCH_SIZE_MIN,
+  end=KMEANS_BATCH_SIZE_MAX,
+  value=KMEANS_BATCH_SIZE_DEFAULT,
+  step=KMEANS_BATCH_SIZE_STEP,
+)
+
+kmeans_max_iter_slider = pn.widgets.IntSlider(
+  name="MiniBatchKMeans: max_iter",
+  start=KMEANS_MAX_ITER_MIN,
+  end=KMEANS_MAX_ITER_MAX,
+  value=KMEANS_MAX_ITER_DEFAULT,
+  step=KMEANS_MAX_ITER_STEP,
 )
 
 
@@ -442,28 +478,47 @@ apply_clustering_button = pn.widgets.Button(
 
 
 def apply_clustering_to_state(event=None) -> None:
-    """Compute PCA/clustering on full state.data and merge results back."""
+    """Compute PCA/clustering once on full state.data and merge results back."""
     if state.data is None or state.data.empty:
         set_status("No data loaded. Cannot compute clustering.", "warning")
         return
-    
-    min_cluster_size = hdbscan_min_cluster_size_slider.value
-    min_samples = hdbscan_min_samples_slider.value
-    
+
+    n_clusters = kmeans_n_clusters_slider.value
+    batch_size = kmeans_batch_size_slider.value
+    max_iter = kmeans_max_iter_slider.value
+
     try:
-        set_status("Computing PCA and clustering... This may take a moment.", "info")
-        
-        # Compute clustering on full state.data
-        enriched_df = compute_pca_clustering(state.data, min_cluster_size, min_samples)
-        
-        # Update state.data with new columns
+        apply_clustering_button.disabled = True
+        set_status("Computing PCA and MiniBatchKMeans clustering...", "info")
+
+        enriched_df = compute_pca_clustering(
+            state.data,
+            n_clusters=n_clusters,
+            batch_size=batch_size,
+            max_iter=max_iter,
+        )
+
         set_data(enriched_df, state.filename)
-        
-        n_clusters = enriched_df.attrs.get("n_clusters", 0)
-        set_status(f"Clustering complete! Found {n_clusters} clusters.", "success")
+
+        found_clusters = enriched_df.attrs.get("n_clusters", 0)
+        n_used = enriched_df.attrs.get("n_complete_case_cells", None)
+        n_excluded = enriched_df.attrs.get("n_excluded_incomplete_cells", None)
+
+        if n_used is not None and n_excluded is not None:
+            set_status(
+                f"Clustering complete. Generated {found_clusters} clusters using "
+                f"{n_used:,} complete-case cells; excluded {n_excluded:,} incomplete cells.",
+                "success",
+            )
+        else:
+            set_status(f"Clustering complete. Generated {found_clusters} clusters.", "success")
+
     except Exception as exc:
         LOGGER.exception("Error applying clustering")
         set_status(f"Error during clustering: {exc}", "danger")
+
+    finally:
+        apply_clustering_button.disabled = False
 
 
 apply_clustering_button.on_click(apply_clustering_to_state)
@@ -595,8 +650,15 @@ def cached_cell_stats(data_revision: int, fov: str) -> dict[str, float | int | N
     }
 
 
-def compute_pca_clustering(df: pd.DataFrame, min_cluster_size: int = 15, min_samples: int = 5) -> pd.DataFrame:
-    """Compute PCA and HDBSCAN clustering on marker data, return enriched DataFrame with results."""
+
+def compute_pca_clustering(
+  df: pd.DataFrame,
+  n_clusters: int = KMEANS_N_CLUSTERS_DEFAULT,
+  batch_size: int = KMEANS_BATCH_SIZE_DEFAULT,
+  max_iter: int = KMEANS_MAX_ITER_DEFAULT,
+) -> pd.DataFrame:
+
+    """Compute PCA and fast MiniBatchKMeans clustering on complete-case marker data."""
     if df is None or df.empty:
         return empty_df()
 
@@ -604,56 +666,86 @@ def compute_pca_clustering(df: pd.DataFrame, min_cluster_size: int = 15, min_sam
     if not marker_cols or len(marker_cols) < 2:
         return df
 
-    # Prepare marker data
-    marker_data = prepare_marker_data_for_pca(df, marker_cols)
-    if marker_data.empty or len(marker_data) < min_cluster_size:
+    X_raw, marker_indices, marker_cols = prepare_marker_matrix_for_analysis(df, marker_cols)
+    n_rows, n_features = X_raw.shape
+
+    if n_rows < 2 or n_features < 2:
         return df
 
+    n_components = min(5, n_features, n_rows)
+    n_clusters = max(2, min(int(n_clusters), n_rows))
+    batch_size = max(256, min(int(batch_size), n_rows))
+
     try:
-        # Standardize
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(marker_data.values)
+        set_status(
+            f"Using {n_rows:,} complete-case cells across {n_features:,} markers for PCA/clustering...",
+            "info",
+        )
 
-        # PCA
-        n_components = 5
-        pca = PCA(n_components=n_components)
-        pc_scores = pca.fit_transform(X_scaled)
+        scaler = StandardScaler(copy=False)
+        X_scaled = scaler.fit_transform(X_raw).astype(np.float32, copy=False)
 
-        # HDBSCAN clustering
-        clusterer = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples)
-        cluster_labels = clusterer.fit_predict(X_scaled)
+        set_status("Computing PCA...", "info")
 
-        # Build result DataFrame with original data + cluster/PC columns
+        pca = PCA(
+            n_components=n_components,
+            svd_solver="randomized" if min(X_scaled.shape) > 500 else "auto",
+            random_state=42,
+        )
+        pc_scores = pca.fit_transform(X_scaled).astype(np.float32, copy=False)
+
+        set_status("Clustering PCA scores with MiniBatchKMeans...", "info")
+
+        clusterer = MiniBatchKMeans(
+            n_clusters=n_clusters,
+            batch_size=batch_size,
+            max_iter=max_iter,
+            n_init="auto",
+            random_state=42,
+            reassignment_ratio=0.01,
+        )
+        cluster_labels = clusterer.fit_predict(pc_scores)
+
         result = df.copy()
 
-        # Initialize cluster and PC columns with NaN
+        result["cluster"] = np.nan
+
+        # Optional temporary compatibility with your existing plotting code.
         result["hdbscan_cluster"] = np.nan
-        for i in range(n_components):
-            result[f"PC{i+1}"] = np.nan
 
-        # Fill in values for rows that have marker data
-        marker_indices = marker_data.index
+        for i in range(5):
+            result[f"PC{i + 1}"] = np.nan
+
+        result.loc[marker_indices, "cluster"] = cluster_labels
         result.loc[marker_indices, "hdbscan_cluster"] = cluster_labels
-        for i in range(n_components):
-            result.loc[marker_indices, f"PC{i+1}"] = pc_scores[:, i]
 
-        # Store metadata in result for visualization
+        for i in range(n_components):
+            result.loc[marker_indices, f"PC{i + 1}"] = pc_scores[:, i]
+
+        loadings = pd.DataFrame(
+            pca.components_.T,
+            index=marker_cols,
+            columns=[f"PC{i + 1} Loading" for i in range(n_components)],
+        )
+
         result.attrs["pca_model"] = pca
         result.attrs["pca_variance_explained"] = pca.explained_variance_ratio_
-        result.attrs["n_clusters"] = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+        result.attrs["pca_loadings"] = loadings
+
+        result.attrs["cluster_algorithm"] = "MiniBatchKMeans"
+        result.attrs["n_clusters"] = int(n_clusters)
+        result.attrs["kmeans_n_clusters"] = int(n_clusters)
+        result.attrs["kmeans_batch_size"] = int(batch_size)
+        result.attrs["kmeans_max_iter"] = int(max_iter)
+        result.attrs["n_complete_case_cells"] = int(n_rows)
+        result.attrs["n_excluded_incomplete_cells"] = int(len(df) - n_rows)
+
 
         return result
+
     except Exception as e:
         LOGGER.exception("Error in PCA/clustering computation: %s", e)
         return df
-
-
-@lru_cache(maxsize=64)
-def cached_pca_clustering(data_revision: int, fov: str, min_cluster_size: int, min_samples: int) -> pd.DataFrame:
-    """Cached wrapper for PCA/clustering computation."""
-    df = cached_filtered_df(data_revision, fov)
-    return compute_pca_clustering(df, min_cluster_size, min_samples)
-
 
 state.param.watch(update_fov_options, "data_revision")
 state.param.watch(update_colorby_options, "data_revision")
@@ -688,25 +780,39 @@ def flex_item(*objects, min_width: int, grow: int = 1, height: int | None = None
 
 
 def plot_box(
-    plot,
-    *,
-    min_height: int = PLOT_MIN_HEIGHT,
-    min_width: int = 320,
-    max_width: int | None = None,
-    title: str | None = None,
-    square: bool = False,
-    aspect_ratio: float | None = None,
-    linked_axes: bool = False,
+  plot,
+  *,
+  min_height: int = PLOT_MIN_HEIGHT,
+  min_width: int = 320,
+  max_width: int | None = None,
+  title: str | None = None,
+  square: bool = False,
+  aspect_ratio: float | None = None,
+  linked_axes: bool = False,
 ) -> pn.Column:
-    header = pn.pane.Markdown(f"#### {title}", margin=(0, 0, 6, 0)) if title else pn.Spacer(height=0)
-    styles = {"overflow": "visible", "box-sizing": "border-box", "width": "100%"}
-    if max_width is not None:
-        styles["max-width"] = f"{max_width}px"
-    if square or aspect_ratio is not None:
-        pane = pn.pane.HoloViews(plot, sizing_mode="scale_width", min_width=min_width, margin=0, linked_axes=linked_axes)
-        return pn.Column(header, pane, min_width=min_width, sizing_mode="stretch_width", styles=styles)
-    pane = pn.pane.HoloViews(plot, sizing_mode="stretch_width", min_height=min_height, linked_axes=linked_axes)
-    return pn.Column(header, pane, min_height=min_height + (32 if title else 0), min_width=min_width, sizing_mode="stretch_width", styles=styles)
+  header = pn.pane.Markdown(f"#### {title}", margin=(0, 0, 6, 0)) if title else pn.Spacer(height=0)
+  styles = {"overflow": "visible", "box-sizing": "border-box", "width": "100%"}
+  if max_width is not None:
+    styles["max-width"] = f"{max_width}px"
+  if square or aspect_ratio is not None:
+    pane = pn.pane.HoloViews(
+      plot,
+      sizing_mode="scale_width",
+      min_width=min_width,
+      min_height=min_height,
+      margin=0,
+      linked_axes=linked_axes,
+    )
+    return pn.Column(
+      header,
+      pane,
+      min_height=min_height + (32 if title else 0),
+      min_width=min_width,
+      sizing_mode="stretch_width",
+      styles=styles,
+    )
+  pane = pn.pane.HoloViews(plot, sizing_mode="stretch_width", min_height=min_height, linked_axes=linked_axes)
+  return pn.Column(header, pane, min_height=min_height + (32 if title else 0), min_width=min_width, sizing_mode="stretch_width", styles=styles)
 
 
 def apply_square_aspect_hook(plot, element):
@@ -1027,143 +1133,182 @@ def build_spatial_plot(df: pd.DataFrame | None, color_by: str = DEFAULT_SPATIAL_
     ).clone()
 
 
-def plot_variance_explained(df: pd.DataFrame | None) -> object:
-    """Plot variance explained by first 5 PCs."""
-    if df is None or df.empty or "pca_variance_explained" not in df.attrs:
-        return panel_message("No PCA data available.")
+def plot_variance_explained_raw(df: pd.DataFrame | None):
+  """Build raw variance-explained plot for the first available PCs."""
+  if df is None or df.empty or "pca_variance_explained" not in df.attrs:
+    return None
 
-    variance = df.attrs.get("pca_variance_explained", np.array([]))
-    if len(variance) < 5:
-        return panel_message("PCA not computed yet.")
+  variance = df.attrs.get("pca_variance_explained", np.array([]))
+  if len(variance) < 1:
+    return None
 
-    # Take first 5 components
-    variance_5 = variance[:5]
-    cumsum_variance = np.cumsum(variance_5)
+  n_components = min(5, len(variance))
+  variance_n = variance[:n_components]
+  cumsum_variance = np.cumsum(variance_n)
 
-    plot_data = pd.DataFrame({
-        "PC": [f"PC{i+1}" for i in range(5)],
-        "Variance %": variance_5 * 100,
-        "Cumulative %": cumsum_variance * 100,
-    })
+  plot_data = pd.DataFrame({
+    "PC": [f"PC{i + 1}" for i in range(n_components)],
+    "Variance %": variance_n * 100,
+    "Cumulative %": cumsum_variance * 100,
+  })
 
-    plot = plot_data.hvplot.bar(
-        x="PC",
-        y="Variance %",
-        color=ACCENT_COLOR,
-        ylabel="Variance Explained (%)",
-        xlabel="Principal Component",
-        title="Variance Explained by PC1-PC5",
-        **plot_kwargs(),
-    )
-
-    return plot
+  return plot_data.hvplot.bar(
+    x="PC",
+    y="Variance %",
+    color=ACCENT_COLOR,
+    ylabel="Variance Explained (%)",
+    xlabel="Principal Component",
+    **plot_kwargs(),
+  )
 
 
-def plot_pca_loadings_heatmap(df: pd.DataFrame | None) -> object:
-    """Plot PC1 vs PC2 loadings as a heatmap."""
-    if df is None or df.empty or "pca_model" not in df.attrs:
-        return panel_message("No PCA data available.")
 
+def marker_channel_sort_key(name: str) -> tuple[str, int, str]:
+  name = str(name)
+  prefix, marker = name.split(".", 1) if "." in name else ("", name)
+
+  prefix_priority = {
+    "Mean": 0,
+    "Max": 1,
+  }
+
+  return (
+    marker.lower(),
+    prefix_priority.get(prefix, 99),
+    name.lower(),
+  )
+
+
+def plot_pca_loadings_heatmap_raw(df: pd.DataFrame | None):
+  """Build raw heatmap for the first available PC loadings."""
+  if df is None or df.empty:
+    return None
+
+  loadings_df = df.attrs.get("pca_loadings")
+
+  if loadings_df is None:
     pca_model = df.attrs.get("pca_model")
     if pca_model is None:
-        return panel_message("PCA model not available.")
+      return None
 
-    try:
-        # Get loadings for PC1 and PC2
-        loadings = pca_model.components_[:2, :].T  # shape: (n_markers, 2)
-        marker_cols = get_marker_columns_extended(df)
-        
-        if not marker_cols or len(loadings) != len(marker_cols):
-            return panel_message("Marker column mismatch.")
+    marker_cols = get_marker_columns_extended(df)
+    if not marker_cols:
+      return None
 
-        # Create DataFrame for heatmap
-        loadings_df = pd.DataFrame(
-            loadings,
-            columns=["PC1 Loading", "PC2 Loading"],
-            index=marker_cols,
-        )
-
-        # Create heatmap using holoviews
-        hmap_data = loadings_df.reset_index().melt(
-            id_vars="index", var_name="Component", value_name="Loading"
-        )
-        hmap_data.columns = ["Marker", "Component", "Loading"]
-
-        hmap = hv.HeatMap(hmap_data, kdims=["Marker", "Component"], vdims=["Loading"])
-        hmap_plot = hmap.opts(
-            cmap="RdBu_r",
-            colorbar=True,
-            xlabel="Principal Component",
-            ylabel="Marker",
-            title="PC1/PC2 Loadings",
-            width=500,
-            height=max(200, len(marker_cols) * 15),
-            toolbar="above",
-            responsive=True,
-        )
-
-        return hmap_plot
-    except Exception as e:
-        LOGGER.exception("Error creating loadings heatmap: %s", e)
-        return panel_message(f"Error creating loadings plot: {e}")
-
-
-def plot_pca_scatter(df: pd.DataFrame | None) -> object:
-    """Plot cells in PC1 vs PC2 space, colored by cluster."""
-    if df is None or df.empty or "PC1" not in df.columns or "hdbscan_cluster" not in df.columns:
-        return panel_message("No PCA or cluster data available.")
-
-    # Extract PC1 and PC2, filter out NaN rows
-    plot_df = df.loc[:, ["PC1", "PC2", "hdbscan_cluster"]].copy()
-    plot_df = plot_df.dropna()
-
-    if plot_df.empty:
-        return panel_message("No valid PCA/cluster data available.")
-
-    # Convert cluster labels to categorical for coloring
-    plot_df["cluster_label"] = plot_df["hdbscan_cluster"].astype(int).astype(str)
-    plot_df["cluster_label"] = plot_df["cluster_label"].replace("-1", "Noise")
-
-
-    plot = plot_df.hvplot.scatter(
-        x="PC1",
-        y="PC2",
-        c="cluster_label",
-        cmap=SPATIAL_CATEGORY_COLORS,
-        xlabel="PC1",
-        ylabel="PC2",
-        title="Cell Distribution in PCA Space",
-        tools=PLOT_TOOLS,
-        legend="right",
-        **plot_kwargs(),
+    loadings_df = pd.DataFrame(
+      pca_model.components_.T,
+      index=marker_cols,
+      columns=[f"PC{i + 1} Loading" for i in range(pca_model.components_.shape[0])],
     )
 
+  desired_cols = [f"PC{i} Loading" for i in range(1, 6)]
+  cols = [c for c in desired_cols if c in loadings_df.columns]
 
-    return plot.opts(toolbar="above", active_tools=["wheel_zoom"], responsive=True)
+  if not cols:
+    return None
+
+  ordered_markers = sorted(loadings_df.index.astype(str), key=marker_channel_sort_key)
+  loadings_df = loadings_df.loc[ordered_markers, cols]
+
+  component_order = [c.replace(" Loading", "") for c in cols]
+
+  hmap_data = loadings_df.reset_index().melt(
+    id_vars="index",
+    var_name="Component",
+    value_name="Loading",
+  )
+
+  hmap_data.columns = ["Marker", "Component", "Loading"]
+  hmap_data["Component"] = hmap_data["Component"].str.replace(" Loading", "", regex=False)
+
+  hmap = hv.HeatMap(
+    hmap_data,
+    kdims=[
+      hv.Dimension("Marker", values=ordered_markers),
+      hv.Dimension("Component", values=component_order),
+    ],
+    vdims=["Loading"],
+  )
+
+  xrotation = 90 if len(ordered_markers) > 20 else 60 if len(ordered_markers) > 12 else 45
+
+  return hmap.opts(
+    cmap="RdBu_r",
+    colorbar=True,
+    xlabel="Marker",
+    xrotation=xrotation,
+    ylabel="Principal Component",
+    toolbar="above",
+    responsive=True,
+  )
+
+
+def apply_square_frame_hook(plot, element):
+  fig = plot.state
+  fig.sizing_mode = "scale_width"
+  fig.aspect_ratio = 1
+
+def plot_pca_scatter_raw(df: pd.DataFrame | None):
+  """Build raw PC1 vs PC2 scatter plot, coloured by cluster."""
+  cluster_col = "cluster" if df is not None and "cluster" in df.columns else "hdbscan_cluster"
+
+  if (
+    df is None
+    or df.empty
+    or "PC1" not in df.columns
+    or "PC2" not in df.columns
+    or cluster_col not in df.columns
+  ):
+    return None
+
+  plot_df = df.loc[:, ["PC1", "PC2", cluster_col]].copy()
+  plot_df = plot_df.dropna()
+
+  if plot_df.empty:
+    return None
+
+  plot_df["cluster_label"] = plot_df[cluster_col].astype(int).astype(str)
+
+  return plot_df.hvplot.scatter(
+    x="PC1",
+    y="PC2",
+    alpha=0.48,
+    c="cluster_label",
+    cmap=SPATIAL_CATEGORY_COLORS,
+    xlabel="PC1",
+    ylabel="PC2",
+    tools=PLOT_TOOLS,
+    legend="right",
+    rasterize=False,
+    **plot_kwargs(),
+  ).opts(
+    toolbar="above",
+    active_tools=["wheel_zoom"],
+    responsive=True,
+    hooks=[apply_square_frame_hook],
+  )
 
 
 def build_spatial_plot_by_cluster(df: pd.DataFrame | None) -> object:
-    """Build spatial plot colored by majority HDBSCAN cluster labels."""
-    
-    if df is None or df.empty or "hdbscan_cluster" not in df.columns:
-        return panel_message("No cluster data available.")
+    """Build spatial plot coloured by majority cluster labels."""
+    if df is None or df.empty:
+        return panel_message("No cluster data available. Click Apply Clustering first.")
+
+    cluster_col = "cluster" if "cluster" in df.columns else "hdbscan_cluster"
+
+    if cluster_col not in df.columns:
+        return panel_message("No cluster data available. Click Apply Clustering first.")
 
     if not has_cols(df, SPATIAL_X_COL, SPATIAL_Y_COL):
         return panel_message("No spatial coordinates available.")
 
-    plot_df = df.copy()
+    plot_df = df.loc[:, [SPATIAL_X_COL, SPATIAL_Y_COL, cluster_col]].copy()
+    plot_df = plot_df.dropna(subset=[cluster_col])
 
-    # Convert cluster labels to categorical strings
-    cluster_labels = (
-        safe_numeric(plot_df["hdbscan_cluster"])
-        .fillna(-1)
-        .astype(int)
-        .astype(str)
-    )
+    if plot_df.empty:
+        return panel_message("No clustered complete-case cells available for this FOV.")
 
-    # Explicitly label noise cluster
-    cluster_labels = cluster_labels.replace("-1", "Noise")
-
+    cluster_labels = safe_numeric(plot_df[cluster_col]).astype("Int64").astype(str)
     plot_df["cluster_label"] = pd.Categorical(cluster_labels)
 
     return build_spatial_plot(
@@ -1171,7 +1316,6 @@ def build_spatial_plot_by_cluster(df: pd.DataFrame | None) -> object:
         color_by="cluster_label",
         sample=False,
     )
-
 
 def compute_fov_cell_qc_flags(df: pd.DataFrame | None) -> dict[str, int]:
     result = {"flagged_fovs": 0, "total_fovs": 0, "flagged_cells": 0, "total_cells": 0}
@@ -1253,6 +1397,21 @@ def build_boxed_metrics_plot(df, x, y, hue, title, *, min_height=PLOT_TALL_MIN_H
     return panel_message("No metrics data available.") if plot is None else plot_box(plot, min_height=min_height, max_width=800, title=title)
 
 
+def build_boxed_spatial_cluster_plot(df: pd.DataFrame | None):
+  plot = build_spatial_plot_by_cluster(df)
+
+  if isinstance(plot, pn.viewable.Viewable):
+    return plot
+
+  return plot_box(
+    plot,
+    aspect_ratio=1,
+    title="Spatial Cluster Map",
+    min_width=PLOT_PANEL_MIN_WIDTH,
+    max_width=800
+  )
+
+
 def build_linked_spatial_views(df: pd.DataFrame | None, color_by: str, *, report_mode: bool):
     if df is None or df.empty:
         return panel_message("No spatial data available.")
@@ -1268,83 +1427,151 @@ def build_linked_spatial_views(df: pd.DataFrame | None, color_by: str, *, report
         gap=FLEX_GAP_WIDE,
     )
 
+
 def build_image_qc_spatial_views(
-    df: pd.DataFrame | None,
-    *,
-    report_mode: bool,
+  df: pd.DataFrame | None,
+  *,
+  report_mode: bool,
 ) -> pn.viewable.Viewable:
-    """Build linked spatial plots for all Max.* image QC channels."""
+  """Build linked spatial plots for all image QC marker channels with identical plot sizes."""
 
-    if df is None or df.empty:
-        return panel_message("No image QC data available.")
+  if df is None or df.empty:
+    return panel_message("No image QC data available.")
 
-    max_cols = get_marker_columns(df)
-    if not max_cols:
-        return panel_message("No marker columns found.")
+  max_cols = get_marker_columns(df)
+  if not max_cols:
+    return panel_message("No marker columns found.")
 
-    # Shared spatial ranges
-    x_range, y_range = compute_shared_spatial_ranges(df)
-    extra_hooks = []
-    if x_range is not None and y_range is not None:
-        extra_hooks.append(create_shared_range_hook(x_range, y_range))
+  x_range, y_range = compute_shared_spatial_ranges(df)
+  extra_hooks = []
+  if x_range is not None and y_range is not None:
+    extra_hooks.append(create_shared_range_hook(x_range, y_range))
 
-    plots = []
-    for col in max_cols:
-        plot = build_spatial_plot(
-            df,
-            color_by=col,
-            sample=not report_mode,
-            extra_hooks=extra_hooks,
+  plots = []
+  for marker_col in max_cols:
+    plot = build_spatial_plot(
+      df,
+      color_by=marker_col,
+      sample=not report_mode,
+      extra_hooks=extra_hooks,
+    )
+
+    if isinstance(plot, pn.viewable.Viewable):
+      plots.append(
+        pn.Column(
+          plot,
+          width=PLOT_PANEL_MIN_WIDTH,
+          height=int(0.8*PLOT_PANEL_MIN_WIDTH),
+          sizing_mode="fixed",
+          styles={
+            "flex": f"0 0 {PLOT_PANEL_MIN_WIDTH}px",
+            "width": f"{PLOT_PANEL_MIN_WIDTH}px",
+            "height": f"{int(0.8*PLOT_PANEL_MIN_WIDTH)}px",
+          },
         )
+      )
+      continue
 
-        plots.append(
-            pn.Column(
-                plot_box(
-                    plot,
-                    aspect_ratio=1,
-                    min_width=PLOT_PANEL_MIN_WIDTH,
-                    title=col,
-                ),
-                sizing_mode="stretch_width",
-                min_width=PLOT_PANEL_MIN_WIDTH,
-                styles={
-                    "flex": f"1 1 {PLOT_PANEL_MIN_WIDTH}px",
-                    "max-width": f"{PLOT_PANEL_MIN_WIDTH * 1.5}px",
-                },
-            )
-        )
+    plot = plot.opts(
+      width=PLOT_PANEL_MIN_WIDTH,
+      height=int(0.8*PLOT_PANEL_MIN_WIDTH),
+      responsive=False,
+    )
 
-    return responsive_flexbox(*plots, gap=FLEX_GAP_WIDE)
+    plots.append(
+      pn.Column(
+        pn.pane.Markdown(f"#### {marker_col}", margin=(0, 0, 6, 0)),
+        pn.pane.HoloViews(
+          plot,
+          width=PLOT_PANEL_MIN_WIDTH,
+          height=int(0.8*PLOT_PANEL_MIN_WIDTH),
+          sizing_mode="fixed",
+          linked_axes=False,
+          margin=0,
+        ),
+        width=PLOT_PANEL_MIN_WIDTH,
+        sizing_mode="fixed",
+        styles={
+          "flex": f"0 0 {PLOT_PANEL_MIN_WIDTH}px",
+          "width": f"{PLOT_PANEL_MIN_WIDTH}px",
+          "box-sizing": "border-box",
+        },
+      )
+    )
+
+  return responsive_flexbox(*plots, gap=FLEX_GAP_WIDE)
+
+def build_boxed_variance_explained_plot(df: pd.DataFrame | None):
+  plot = plot_variance_explained_raw(df)
+
+  if plot is None:
+    return panel_message("No PCA variance data available. Click Apply Clustering first.")
+
+  return plot_box(
+    plot,
+    title="",
+    min_height=PLOT_MIN_HEIGHT,
+    min_width=PLOT_PANEL_MIN_WIDTH,
+  )
+
+def build_boxed_pca_loadings_heatmap(df: pd.DataFrame | None):
+  plot = plot_pca_loadings_heatmap_raw(df)
+
+  if plot is None:
+    return panel_message("No PCA loading data available. Click Apply Clustering first.")
+
+  n_markers = 0
+  loadings_df = df.attrs.get("pca_loadings") if df is not None else None
+  if loadings_df is not None:
+    n_markers = len(loadings_df)
+
+  return plot_box(
+    plot,
+    title="",
+    min_height=max(PLOT_MIN_HEIGHT, 160 + n_markers * 14),
+    min_width=PLOT_PANEL_MIN_WIDTH,
+    max_width=800,
+  )
+
+def build_boxed_pca_scatter(df: pd.DataFrame | None):
+  plot = plot_pca_scatter_raw(df)
+
+  if plot is None:
+    return panel_message("No valid complete-case PCA/cluster data available. Click Apply Clustering first.")
+
+  return plot_box(
+    plot,
+    title="",
+    min_height=PLOT_MIN_HEIGHT,
+    max_width=800,
+    aspect_ratio=1
+  )
 
 def make_component_bindings(report_mode: bool = False) -> dict[str, object]:
-    pca_clustered_df = pn.bind(
-        cached_pca_clustering,
-        state.param.data_revision,
-        fov_select,
-        hdbscan_min_cluster_size_slider,
-        hdbscan_min_samples_slider,
-    )
-    
-    return {
-        "status_pane": pn.bind(create_status_pane, state.param.status_message, state.param.status_level),
-        "indicators": pn.bind(create_indicators, cell_stats),
-        "qc_flag_cards": pn.bind(create_qc_flag_cards, filtered_df),
-        "linked_spatial_views": pn.bind(build_linked_spatial_views, filtered_df, color_by_select, report_mode=report_mode),
-        "qc_metrics_tbl": pn.bind(build_qc_metrics_table, filtered_df),
-        "negprobes_hist": pn.bind(build_boxed_histogram, filtered_df, "nCount_negprobes", ""),
-        "rna_vs_negprobes": pn.bind(build_boxed_scatter, filtered_df, "nCount_RNA", "nCount_negprobes", ""),
-        "metrics_jointplot": pn.bind(build_boxed_metrics_plot, filtered_df, "nCount_RNA", "nFeature_RNA", "Area.um2", ""),
-        "rna_hist": pn.bind(build_boxed_histogram, filtered_df, "nCount_RNA", ""),
-        "feature_hist": pn.bind(build_boxed_histogram, filtered_df, "nFeature_RNA", ""),
-        "area_hist": pn.bind(build_boxed_histogram, filtered_df, "Area.um2", ""),
-        "image_qc_spatial": pn.bind(build_image_qc_spatial_views, filtered_df, report_mode=report_mode,
-        ),
-        # PCA/clustering components
-        "variance_explained_plot": pn.bind(plot_variance_explained, pca_clustered_df),
-        "pca_loadings_heatmap": pn.bind(plot_pca_loadings_heatmap, pca_clustered_df),
-        "pca_scatter": pn.bind(plot_pca_scatter, pca_clustered_df),
-        "spatial_clusters": pn.bind(build_spatial_plot_by_cluster, pca_clustered_df),
-    }
+  return {
+    "status_pane": pn.bind(create_status_pane, state.param.status_message, 
+      state.param.status_level),
+    "indicators": pn.bind(create_indicators, cell_stats),
+    "qc_flag_cards": pn.bind(create_qc_flag_cards, filtered_df),
+    "linked_spatial_views": pn.bind(build_linked_spatial_views, filtered_df, 
+      color_by_select, report_mode=report_mode),
+    "qc_metrics_tbl": pn.bind(build_qc_metrics_table, filtered_df),
+    "negprobes_hist": pn.bind(build_boxed_histogram, filtered_df, 
+      "nCount_negprobes", ""),
+    "rna_vs_negprobes": pn.bind(build_boxed_scatter, filtered_df, 
+      "nCount_RNA", "nCount_negprobes", ""),
+    "metrics_jointplot": pn.bind(build_boxed_metrics_plot, filtered_df,
+      "nCount_RNA", "nFeature_RNA", "Area.um2", ""),
+    "rna_hist": pn.bind(build_boxed_histogram, filtered_df, "nCount_RNA", ""),
+    "feature_hist": pn.bind(build_boxed_histogram, filtered_df, "nFeature_RNA", ""),
+    "area_hist": pn.bind(build_boxed_histogram, filtered_df, "Area.um2", ""),
+    "image_qc_spatial": pn.bind(build_image_qc_spatial_views, filtered_df,
+      report_mode=report_mode,),
+    "variance_explained_plot": pn.bind(build_boxed_variance_explained_plot, filtered_df),
+    "pca_loadings_heatmap": pn.bind(build_boxed_pca_loadings_heatmap, filtered_df),
+    "pca_scatter": pn.bind(build_boxed_pca_scatter, filtered_df),
+    "spatial_clusters": pn.bind(build_boxed_spatial_cluster_plot, filtered_df),
+  }
 
 
 def build_summary_tab(views: Mapping[str, object]) -> pn.Column:
@@ -1360,27 +1587,35 @@ def build_summary_tab(views: Mapping[str, object]) -> pn.Column:
 
 
 def build_details_tab(views: Mapping[str, object]) -> pn.Column:
-    return pn.Column(
-        pn.pane.Markdown("### Run Details"),
-        pn.pane.Markdown("### Cell Metrics"),
-        responsive_flexbox(
-            flex_item(views["metrics_jointplot"], min_width=600),
-            flex_item(views["area_hist"], min_width=200),
-            flex_item(views["rna_hist"], min_width=200),
-            flex_item(views["feature_hist"], min_width=200),
-            gap="16px",
-        ),
-        pn.pane.Markdown("### Negative Probes"),
-        responsive_flexbox(
-            flex_item(views["negprobes_hist"], min_width=300),
-            flex_item(views["rna_vs_negprobes"], min_width=300),
-            gap="16px",
-        ),
-        pn.pane.Markdown("### FOV-level Metrics Table"),
-        responsive_flexbox(flex_item(views["qc_metrics_tbl"], min_width=800), gap="16px"),
-        sizing_mode="stretch_both",
-        styles={"overflow-y": "auto"},
-    )
+  return pn.Column(
+    pn.pane.Markdown("### Cell Metrics"),
+    responsive_flexbox(
+      flex_item(views["metrics_jointplot"], min_width=PLOT_PANEL_MIN_WIDTH),
+      responsive_flexbox(
+        flex_item(views["area_hist"], min_width=120),
+        flex_item(views["rna_hist"], min_width=120),
+        flex_item(views["feature_hist"], min_width=120),
+        gap=FLEX_GAP_DEFAULT),
+      gap=FLEX_GAP_WIDE,
+    ),
+    # responsive_flexbox(
+    #   flex_item(views["metrics_jointplot"], min_width=600),
+    #   flex_item(views["area_hist"], min_width=200),
+    #   flex_item(views["rna_hist"], min_width=200),
+    #   flex_item(views["feature_hist"], min_width=200),
+    #   gap="16px",
+    # ),
+    pn.pane.Markdown("### Negative Probes"),
+    responsive_flexbox(
+      flex_item(views["negprobes_hist"], min_width=300),
+      flex_item(views["rna_vs_negprobes"], min_width=300),
+      gap=FLEX_GAP_WIDE,
+    ),
+    pn.pane.Markdown("### FOV-level Metrics Table"),
+    responsive_flexbox(flex_item(views["qc_metrics_tbl"], min_width=800), gap=FLEX_GAP_WIDE),
+    sizing_mode="stretch_both",
+    styles={"overflow-y": "auto"},
+  )
 
 
 def build_image_qc_tab(views: Mapping[str, object]) -> pn.Column:
@@ -1393,54 +1628,62 @@ def build_image_qc_tab(views: Mapping[str, object]) -> pn.Column:
 
 
 def build_analysis_tab(views: Mapping[str, object]) -> pn.Column:
-    return pn.Column(
-        pn.pane.Markdown("### Marker-based Analysis: PCA & HDBSCAN Clustering"),
-        pn.pane.Markdown("Dimensionality reduction and unsupervised clustering on IF markers (Mean.* and Max.* columns)."),
-        
-        pn.pane.Markdown("#### Variance Explained"),
-        responsive_flexbox(
-            flex_item(views["variance_explained_plot"], min_width=400),
-            gap=FLEX_GAP_DEFAULT,
+  return pn.Column(
+    pn.pane.Markdown("### Marker-based Analysis: PCA &amp; Clustering"),
+    pn.pane.Markdown(
+      "Dimensionality reduction and fast unsupervised clustering on complete-case IF marker profiles "
+      "(Mean.* and Max.* columns). Cells with missing marker values are excluded from PCA/clustering."
+    ),
+    pn.pane.Markdown("#### Principal Component Analysis"),
+    responsive_flexbox(
+      flex_item(
+        pn.Column(
+          views["variance_explained_plot"],
+          views["pca_loadings_heatmap"],
+          sizing_mode="stretch_width",
+          styles={
+            "gap": FLEX_GAP_DEFAULT,
+            "display": "flex",
+            "flex-direction": "column",
+            "width": "100%",
+          },
         ),
-        
-        pn.pane.Markdown("#### PC1/PC2 Loadings & PCA Scatter"),
-        responsive_flexbox(
-            flex_item(views["pca_loadings_heatmap"], min_width=300, grow=1),
-            flex_item(views["pca_scatter"], min_width=400, grow=1),
-            gap=FLEX_GAP_WIDE,
-        ),
-        
-        pn.pane.Markdown("#### Cluster Distribution in Spatial Coordinates"),
-        responsive_flexbox(
-            
-          flex_item(
-              plot_box(
-                  views["spatial_clusters"],
-                  aspect_ratio=1,
-                  title="Spatial Cluster Map",
-                  min_width=PLOT_PANEL_MIN_WIDTH,
-              ),
-              min_width=PLOT_PANEL_MIN_WIDTH,
-          ),
-            gap=FLEX_GAP_DEFAULT,
-        ),
-        
-        sizing_mode="stretch_both",
-        styles={"overflow-y": "auto"},
-    )
+        min_width=PLOT_PANEL_MIN_WIDTH,
+        grow=1,
+        allow_shrink_below_min=True,
+      ),
+      flex_item(
+        views["pca_scatter"],
+        min_width=PLOT_PANEL_MIN_WIDTH,
+        grow=1,
+        allow_shrink_below_min=True,
+      ),
+      gap=FLEX_GAP_WIDE,
+    ),
+    pn.pane.Markdown("#### Cluster Distribution in Spatial Coordinates"),
+    responsive_flexbox(
+      flex_item(
+        views["spatial_clusters"],
+        min_width=PLOT_PANEL_MIN_WIDTH,
+      ),
+      gap=FLEX_GAP_WIDE,
+    ),
+    sizing_mode="stretch_both",
+    styles={"overflow-y": "auto"},
+  )
 
 
 def create_tabs(views: Mapping[str, object], report_mode: bool = False) -> pn.Tabs:
-    return pn.Tabs(
-        ("Summary", build_summary_tab(views)),
-        ("Run Details", build_details_tab(views)),
-        ("Image QC", build_image_qc_tab(views)),
-        ("Analysis", build_analysis_tab(views)),
-        dynamic=not report_mode,
-        styles=CARD_STYLES,
-        sizing_mode="stretch_both",
-        margin=10,
-    )
+  return pn.Tabs(
+    ("Summary", build_summary_tab(views)),
+    ("Run Details", build_details_tab(views)),
+    ("Image QC", build_image_qc_tab(views)),
+    ("Analysis", build_analysis_tab(views)),
+    dynamic=not report_mode,
+    styles=CARD_STYLES,
+    sizing_mode="stretch_both",
+    margin=10,
+  )
 
 
 def loaded_filename_pane():
@@ -1459,48 +1702,60 @@ def title_pane():
 
 
 def create_template(report_mode: bool = False) -> pn.template.BootstrapTemplate:
-    views = make_component_bindings(report_mode=report_mode)
-    tabs = create_tabs(views, report_mode=report_mode)
+  views = make_component_bindings(report_mode=report_mode)
+  tabs = create_tabs(views, report_mode=report_mode)
 
-    main = [pn.Column(title_pane(), tabs, sizing_mode="stretch_both")]
-    if report_mode:
-        return pn.template.BootstrapTemplate(
-            title="Spatial Profiling Overview Tool [STATIC]",
-            site="POPIDD-SPOT",
-            site_url="https://github.com/IntegratedPathologyUnit-ICR/popidd-spot",
-            header_background="#d4a300",
-            main=main,
-        )
-
-    sidebar_items = [
-        pn.pane.Markdown("### Load Data"),
-        pn.pane.Markdown("Upload one `.csv` file (large files supported):"),
-        file_dropper,
-        pending_filename_pane(),
-        load_button,
-        loaded_filename_pane(),
-        views["status_pane"],
-        pn.pane.Markdown("### Filters"),
-        fov_select,
-        color_by_select,
-        pn.pane.Markdown("### Clustering Parameters"),
-        hdbscan_min_cluster_size_slider,
-        hdbscan_min_samples_slider,
-        apply_clustering_button,
-        pn.pane.Markdown("### Export"),
-        export_html_button,
-        export_csv_button,
-    ]
-
+  main = [pn.Column(title_pane(), tabs, sizing_mode="stretch_both")]
+  if report_mode:
     return pn.template.BootstrapTemplate(
-        title="Spatial Profiling Overview Tool [LIVE]",
-        site="POPIDD-SPOT",
-        site_url="https://github.com/IntegratedPathologyUnit-ICR/popidd-spot",
-        sidebar=sidebar_items,
-        collapsed_sidebar=True,
-        header_background="#d4a300",
-        main=main,
+      title="Spatial Profiling Overview Tool [STATIC]",
+      site="POPIDD-SPOT",
+      site_url="https://github.com/IntegratedPathologyUnit-ICR/popidd-spot",
+      header_background="#d4a300",
+      main=main,
     )
+
+  sidebar_items = [
+    pn.pane.Markdown("### Load Data"),
+    pn.pane.Markdown("Upload one `.csv` file (large files supported):"),
+    file_dropper,
+    pending_filename_pane(),
+    load_button,
+    loaded_filename_pane(),
+    views["status_pane"],
+    pn.pane.Markdown("### Filters"),
+    fov_select,
+    color_by_select,
+    pn.pane.Markdown("### Clustering Parameters"),
+    
+    pn.pane.Markdown(
+      f"""
+      Defaults are tuned for fast exploratory clustering of PCA-reduced marker profiles:
+
+      - `n_clusters={KMEANS_N_CLUSTERS_DEFAULT}` balances phenotypic resolution and interpretability.
+      - `batch_size={KMEANS_BATCH_SIZE_DEFAULT:,}` gives stable mini-batch updates while remaining memory efficient.
+      - `max_iter={KMEANS_MAX_ITER_DEFAULT}` provides a practical speed/convergence trade-off for interactive use.
+      """
+    ),
+
+    kmeans_n_clusters_slider,
+    kmeans_batch_size_slider,
+    kmeans_max_iter_slider,
+    apply_clustering_button,
+    pn.pane.Markdown("### Export"),
+    export_html_button,
+    export_csv_button,
+  ]
+
+  return pn.template.BootstrapTemplate(
+    title="Spatial Profiling Overview Tool [LIVE]",
+    site="POPIDD-SPOT",
+    site_url="https://github.com/IntegratedPathologyUnit-ICR/popidd-spot",
+    sidebar=sidebar_items,
+    collapsed_sidebar=True,
+    header_background="#d4a300",
+    main=main,
+  )
 
 
 def save_as_html(filename: str | os.PathLike = DEFAULT_REPORT_PATH) -> None:
@@ -1554,9 +1809,59 @@ export_csv_button.on_click(on_export_csv_clicked)
 app = create_template(report_mode=False).servable()
 
 
+def has_analysis_results(df: pd.DataFrame | None) -> bool:
+    return (
+        df is not None
+        and not df.empty
+        and "PC1" in df.columns
+        and "PC2" in df.columns
+        and ("cluster" in df.columns or "hdbscan_cluster" in df.columns)
+        and "pca_variance_explained" in df.attrs
+    )
+
+
+def run_default_analysis_for_report() -> None:
+    """Run PCA/clustering with default parameters before generating a static report."""
+    df = get_source_data()
+
+    if df is None or df.empty:
+        set_status("No data loaded. Static report will not include PCA/clustering analysis.", "warning")
+        return
+
+    if has_analysis_results(df):
+        return
+
+    set_status("Running default PCA/clustering analysis for static HTML report...", "info")
+
+    enriched_df = compute_pca_clustering(
+        df,
+        n_clusters=KMEANS_N_CLUSTERS_DEFAULT,
+        batch_size=KMEANS_BATCH_SIZE_DEFAULT,
+        max_iter=KMEANS_MAX_ITER_DEFAULT,
+    )
+
+    set_data(enriched_df, state.filename)
+
+    found_clusters = enriched_df.attrs.get("n_clusters", 0)
+    n_used = enriched_df.attrs.get("n_complete_case_cells", None)
+    n_excluded = enriched_df.attrs.get("n_excluded_incomplete_cells", None)
+
+    if n_used is not None and n_excluded is not None:
+        set_status(
+            f"Static report analysis complete. Generated {found_clusters} clusters using "
+            f"{n_used:,} complete-case cells; excluded {n_excluded:,} incomplete cells.",
+            "success",
+        )
+    else:
+        set_status(
+            f"Static report analysis complete. Generated {found_clusters} clusters.",
+            "success",
+        )
+
 def main() -> None:
-    save_as_html()
+  run_default_analysis_for_report()
+  save_as_html()
 
 
 if __name__ == "__main__":
-    main()
+  main()

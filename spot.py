@@ -5,9 +5,11 @@ import io
 import logging
 import os
 import re
+from contextlib import suppress
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Mapping
 
 import holoviews as hv
@@ -1781,7 +1783,7 @@ def create_tabs(views: Mapping[str, object], report_mode: bool = False) -> pn.Ta
         ("Run Details", build_details_tab(views)),
         ("Image QC", build_image_qc_tab(views)),
         ("Analysis", build_analysis_tab(views)),
-        dynamic=not report_mode,
+        dynamic=False,
         styles=CARD_STYLES,
         sizing_mode="stretch_both",
         margin=10,
@@ -1882,7 +1884,19 @@ def save_as_html(filename: str | os.PathLike = DEFAULT_REPORT_PATH) -> None:
     """Save the current dashboard as a static HTML file."""
     output = Path(filename)
     output.parent.mkdir(parents=True, exist_ok=True)
-    create_template(report_mode=True).save(str(output), resources="cdn")
+    report_template = create_template(report_mode=True)
+    try:
+        report_template.save(str(output), resources="cdn")
+    finally:
+        report_doc = report_template._documents[-1] if report_template._documents else None
+        if report_doc is not None:
+            session_context = SimpleNamespace(_document=report_doc)
+            for obj, _ in report_template._render_items.values():
+                if report_doc in getattr(obj, "_documents", {}):
+                    with suppress(KeyError):
+                        obj._server_destroy(session_context)
+            with suppress(KeyError):
+                report_template._server_destroy(session_context)
     LOGGER.info("Dashboard saved to %s", output)
 
 
